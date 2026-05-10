@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vyxel Apps — Open-source GitHub app store</title>
+<meta name="description" content="Discover, install, and update Android apps directly from GitHub. Free, open-source, no ads, no tracking.">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0b0d10;
+  --surface: #14171c;
+  --accent: #6366f1;
+  --accent-2: #8b5cf6;
+  --text: #f5f5f7;
+  --muted: #8b9098;
+  --border: #1f2329;
+}
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  line-height: 1.6; overflow-x: hidden;
+}
+.container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+nav {
+  position: fixed; top: 0; left: 0; right: 0;
+  background: rgba(11,13,16,0.85); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border); z-index: 100;
+  padding: 16px 0;
+}
+nav .container { display: flex; justify-content: space-between; align-items: center; }
+.logo { font-weight: 800; font-size: 20px; }
+.nav-links a { color: var(--muted); text-decoration: none; margin-left: 24px; font-size: 14px; }
+.nav-links a:hover { color: var(--text); }
+
+.hero { padding: 160px 0 100px; text-align: center; position: relative; overflow: hidden; }
+.hero::before {
+  content: ""; position: absolute; top: -50%; left: 50%; transform: translateX(-50%);
+  width: 800px; height: 800px;
+  background: radial-gradient(circle, rgba(99,102,241,0.15), transparent 60%);
+  filter: blur(40px); z-index: -1;
+}
+.badge {
+  display: inline-block; padding: 6px 14px; background: rgba(99,102,241,0.15);
+  color: var(--accent); border-radius: 20px; font-size: 12px; font-weight: 600;
+  letter-spacing: 1px; text-transform: uppercase; margin-bottom: 24px;
+}
+h1 {
+  font-size: clamp(40px, 7vw, 76px); font-weight: 900; line-height: 1.05;
+  background: linear-gradient(135deg, #fff 0%, #b0b3c0 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  margin-bottom: 24px;
+}
+.hero-sub { font-size: 19px; color: var(--muted); max-width: 600px; margin: 0 auto 40px; }
+.cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 15px;
+  text-decoration: none; transition: transform 0.2s, box-shadow 0.2s;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: white; box-shadow: 0 8px 32px rgba(99,102,241,0.35);
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 40px rgba(99,102,241,0.5); }
+.btn-secondary {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { background: #1c2026; }
+
+.section { padding: 80px 0; }
+.section h2 { font-size: 36px; font-weight: 800; margin-bottom: 16px; text-align: center; }
+.section-sub { text-align: center; color: var(--muted); font-size: 16px; margin-bottom: 60px; }
+
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+.feature {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; padding: 28px;
+}
+.feature-icon { font-size: 32px; margin-bottom: 16px; }
+.feature h3 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.feature p { color: var(--muted); font-size: 14px; }
+
+.screenshots { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.screenshots img {
+  width: 100%; border-radius: 16px;
+  border: 1px solid var(--border);
+}
+
+footer { padding: 60px 0; text-align: center; color: var(--muted); border-top: 1px solid var(--border); }
+footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <div class="logo">⬡ Vyxel Apps</div>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/NikhilKain/vyxel-apps">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <div class="badge">v1.0 · Open Source · Free Forever</div>
+    <h1>The GitHub-powered<br>Android app store.</h1>
+    <p class="hero-sub">
+      Discover, install, and update apps directly from GitHub releases. No ads. No tracking.
+      Built for people who care about open-source.
+    </p>
+    <div class="cta-row">
+      <a href="https://github.com/NikhilKain/vyxel-apps/releases/latest/download/app-release.apk" class="btn btn-primary">
+        ⬇ Download APK
+      </a>
+      <a href="https://github.com/NikhilKain/vyxel-apps" class="btn btn-secondary">
+        ⭐ Star on GitHub
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="features">
+  <div class="container">
+    <h2>Everything you need.</h2>
+    <p class="section-sub">A complete app store experience — without the corporate baggage.</p>
+    <div class="features">
+      <div class="feature"><div class="feature-icon">🔍</div><h3>Smart Discovery</h3><p>18+ curated categories from privacy tools to games to productivity apps.</p></div>
+      <div class="feature"><div class="feature-icon">⚡</div><h3>Smart APK Detection</h3><p>Auto-picks the right architecture for your device — arm64, arm, x86.</p></div>
+      <div class="feature"><div class="feature-icon">🛡</div><h3>Trust Score</h3><p>Every app gets a 0–100 score based on stars, activity, releases, and forks.</p></div>
+      <div class="feature"><div class="feature-icon">🔔</div><h3>Background Updates</h3><p>Get notified when your installed apps have new releases. Skip versions you don't want.</p></div>
+      <div class="feature"><div class="feature-icon">⚖️</div><h3>App Comparison</h3><p>Compare two apps side-by-side — features, stars, ecosystem.</p></div>
+      <div class="feature"><div class="feature-icon">🌙</div><h3>Beautiful UI</h3><p>Dark, light, AMOLED themes. Custom accent colors. Material 3 design.</p></div>
+      <div class="feature"><div class="feature-icon">🔄</div><h3>Install History & Rollback</h3><p>Keeps your last 3 versions. Roll back when an update breaks something.</p></div>
+      <div class="feature"><div class="feature-icon">⭐</div><h3>GitHub Sync</h3><p>Sync your starred repos directly into your favourites.</p></div>
+      <div class="feature"><div class="feature-icon">🌍</div><h3>Multi-language</h3><p>Translate app descriptions into your language with one tap.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="download">
+  <div class="container" style="text-align: center;">
+    <h2>Install Vyxel today.</h2>
+    <p class="section-sub">Free, open-source, and built with love.</p>
+    <a href="https://github.com/NikhilKain/vyxel-apps/releases/latest" class="btn btn-primary">⬇ Download Latest APK</a>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>Built with ❤️ by <a href="https://github.com/NikhilKain">Nikhil</a></p>
+    <p style="margin-top: 8px;">MIT License · <a href="https://github.com/NikhilKain/vyxel-apps">Source on GitHub</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
