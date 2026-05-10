@@ -18,6 +18,11 @@ Discover, install, and update Android apps from GitHub releases — free, open-s
 
 ---
 
+> ⚠️ **Official Source Notice**
+> The ONLY official source for Vyxel Apps is this repository.
+> APKs from any other website, Telegram channel, or source are
+> unofficial and may be tampered with. Always verify the signature.
+
 ## ✨ Features
 
 - 🔍 **18+ curated categories** — Privacy, Media, Games, Productivity, Dev Tools, and more
