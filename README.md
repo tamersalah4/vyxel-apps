@@ -91,6 +91,9 @@ If you enjoy the project and want to support future development, bug fixes, and 
 
 UPI I'd:- vyxelapps@airtel
 
+🌍 International Support:  
+https://ko-fi.com/vyxelapps
+
 Every contribution genuinely helps and is greatly appreciated ❤️
 
 ---
