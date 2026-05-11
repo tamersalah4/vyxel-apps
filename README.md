@@ -33,7 +33,6 @@ Discover, install, and update Android apps from GitHub releases — free, open-s
 - 📸 **Screenshots from repos** — auto-extracted from README
 - 🔄 **Install history & rollback** — keeps your last 3 versions
 - ⭐ **GitHub starred repos sync** — sync your stars into favourites
-- 🌍 **Multi-language descriptions** — translate to Hindi, Spanish, French, etc.
 - 🌙 **Material 3 themes** — dark, light, AMOLED, custom accents
 
 ## 📱 Screenshots
