@@ -76,8 +76,26 @@ If Vyxel Apps is useful to you:
 
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
+
+## ☕ Support Development
+
+Hi! I'm Nikhil, an indie Android developer building this project independently.
+
+This app is focused on making GitHub apps easier to discover and install on Android.
+
+If you enjoy the project and want to support future development, bug fixes, and new features, consider supporting the project ☕
+
+### UPI Support
+
+| <img src="docs/upi.png" width="200"/> |
+
+UPI I'd:- vyxelapps@airtel
+
+Every contribution genuinely helps and is greatly appreciated ❤️
+
 ---
 
 <div align="center">
 Built with ❤️ for the open-source community.
 </div>
+
