@@ -37,7 +37,7 @@ Discover, install, and update Android apps from GitHub releases — free, open-s
 
 ## 📱 Screenshots
 
-| <img src="docs/1.jpeg" width="200"/> | <img src="docs/2.jpeg" width="200"/> | <img src="3.jpeg" width="200"/> | <img src="docs/4.jpeg" width="200"/> |
+| <img src="docs/1.jpeg" width="200"/> | <img src="docs/2.jpeg" width="200"/> | <img src="docs/3.jpeg" width="200"/> | <img src="docs/4.jpeg" width="200"/> |
 
 ## 📥 Installation
 
