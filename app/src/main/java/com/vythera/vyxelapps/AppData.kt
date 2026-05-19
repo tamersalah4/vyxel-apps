@@ -1137,48 +1137,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             loadPage = (loadPage % 8) + 1
             state = state.copy(isLoading = true, error = null, trendingPage = 1, refreshToken = state.refreshToken + 1)
 
-            // ── Phase 1: All CDN sources in parallel ─────────────────────────
-            // GitHub CDN → category rows  |  Other CDN sources → source rows
+            // ── Phase 1: CDN sources — GitHub awaited, others fire-and-forget ──
+            // Non-GitHub sources update state as they arrive; only GitHub blocks
+            // because home-screen category rows depend on it.
+            // IzzyOnDroid live fetch is intentionally excluded here — it downloads
+            // a large JSON and is only loaded when the user opens Browse → Izzy.
             try {
                 val c = MetadataManager.get()
 
-                suspend fun cdnSource(key: String): List<GitHubRepo> {
-                    val b = try { c.browseSource(key, 1).apps.map { it.toGitHubRepo() } }
-                             catch (_: Exception) { emptyList() }
-                    if (b.isNotEmpty()) return b
-                    return try { c.search("", source = key).take(50).map { it.toGitHubRepo() } }
-                           catch (_: Exception) { emptyList() }
-                }
+                suspend fun cdnSource(key: String): List<GitHubRepo> =
+                    try { c.browseSource(key, 1).apps.map { it.toGitHubRepo() } }
+                    catch (_: Exception) { emptyList() }
 
-                val ghD = async {
-                    val b = try { c.browseSource("github", 1).apps } catch (_: Exception) { emptyList<com.vythera.vyxelapps.api.AppEntry>() }
-                    if (b.isNotEmpty()) b
-                    else try { c.search("", source = "github").take(200) } catch (_: Exception) { emptyList() }
-                }
-                val glD = async { cdnSource("gitlab").ifEmpty { try { GitLabClient.service.searchProjects(query = "android", perPage = 30).map { it.toUnifiedRepo() } } catch (_: Exception) { emptyList() } } }
-                val cbD = async { cdnSource("codeberg").ifEmpty { try { CodebergClient.service.searchRepos(query = "android", topic = true, limit = 30).data.map { it.toUnifiedRepo() } } catch (_: Exception) { emptyList() } } }
-                val fdD = async { cdnSource("fdroid") }
-                val fhD = async {
-                    val x = cdnSource("flathub")
-                    if (x.isNotEmpty()) x else try { FlathubClient.service.getPopular().hits?.map { it.toUnifiedRepo() } ?: emptyList() } catch (_: Exception) { emptyList() }
-                }
-                val wgD = async { cdnSource("winget") }
-                val izD = async {
-                    val b = try { c.browseSource("izzy", 1).apps.map { it.toGitHubRepo() } } catch (_: Exception) { emptyList() }
-                    if (b.isNotEmpty()) return@async b
-                    val s = try { c.search("", source = "izzy").take(50).map { it.toGitHubRepo() } } catch (_: Exception) { emptyList() }
-                    if (s.isNotEmpty()) return@async s
-                    try { IzzyOnDroidClient.getApps(50) } catch (_: Exception) { emptyList() }
-                }
+                // Non-critical sources: update state independently as each finishes
+                launch { val gl = cdnSource("gitlab"); if (isActive && gl.isNotEmpty()) state = state.copy(gitlabApps = gl) }
+                launch { val cb = cdnSource("codeberg"); if (isActive && cb.isNotEmpty()) state = state.copy(codebergApps = cb) }
+                launch { val fd = cdnSource("fdroid"); if (isActive && fd.isNotEmpty()) state = state.copy(fdroidApps = fd) }
+                launch { val fh = cdnSource("flathub"); if (isActive && fh.isNotEmpty()) state = state.copy(flathubApps = fh) }
+                launch { val wg = cdnSource("winget"); if (isActive && wg.isNotEmpty()) state = state.copy(wingetApps = wg) }
+                launch { val iz = cdnSource("izzy"); if (isActive && iz.isNotEmpty()) state = state.copy(izzyApps = iz) }
 
-                val ghEntries = ghD.await()
-                val gl = glD.await(); val cb = cbD.await(); val fd = fdD.await()
-                val fh = fhD.await(); val wg = wgD.await(); val iz = izD.await()
+                // GitHub is awaited — home screen category rows depend on it
+                val ghEntries = try { c.browseSource("github", 1).apps }
+                                catch (_: Exception) { emptyList<com.vythera.vyxelapps.api.AppEntry>() }
+                val ghList = ghEntries.ifEmpty {
+                    try { c.search("", source = "github").take(200) } catch (_: Exception) { emptyList() }
+                }
 
                 if (!isActive) { state = state.copy(isLoading = false); return@launch }
 
-                // Distribute CDN GitHub apps to category rows by keyword matching.
-                // Falls back to full CDN list for any category that has no keyword matches.
                 fun List<com.vythera.vyxelapps.api.AppEntry>.toRows(vararg kws: String): List<GitHubRepo> {
                     val matched = filter { e ->
                         kws.any { k ->
@@ -1189,34 +1176,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     return (if (matched.isNotEmpty()) matched else this).shuffled().take(20).map { it.toGitHubRepo() }
                 }
 
-                var ns = state.copy(
-                    gitlabApps = gl, codebergApps = cb, fdroidApps = fd,
-                    flathubApps = fh, wingetApps = wg, izzyApps = iz,
-                    isLoading = false
-                )
-                if (ghEntries.isNotEmpty()) {
-                    ns = ns.copy(
-                        trending     = ghEntries.shuffled().take(20).map { it.toGitHubRepo() },
-                        media        = ghEntries.toRows("media", "player", "video", "stream"),
-                        tools        = ghEntries.toRows("tool", "utility", "manager"),
-                        games        = ghEntries.toRows("game", "emulat"),
-                        browsers     = ghEntries.toRows("browser"),
-                        productivity = ghEntries.toRows("productivity", "note", "office", "task"),
-                        security     = ghEntries.toRows("security", "privacy", "encrypt"),
-                        devtools     = ghEntries.toRows("developer", "dev-tool", "terminal", "ssh"),
-                        photoVideo   = ghEntries.toRows("photo", "camera", "gallery", "image"),
-                        music        = ghEntries.toRows("music", "podcast", "radio"),
-                        finance      = ghEntries.toRows("finance", "banking", "budget", "money"),
-                        education    = ghEntries.toRows("education", "learn", "study", "language"),
-                        fitness      = ghEntries.toRows("fitness", "health", "workout", "exercise"),
-                        artDesign    = ghEntries.toRows("art", "design", "draw", "creative"),
-                        news         = ghEntries.toRows("news", "rss", "feed", "reader"),
-                        social       = ghEntries.toRows("social", "messag", "chat", "network"),
-                        cloudStorage = ghEntries.toRows("cloud", "storage", "backup", "sync"),
-                        cooking      = ghEntries.toRows("cooking", "food", "recipe")
+                state = if (ghList.isNotEmpty()) {
+                    state.copy(
+                        isLoading    = false,
+                        trending     = ghList.shuffled().take(20).map { it.toGitHubRepo() },
+                        media        = ghList.toRows("media", "player", "video", "stream"),
+                        tools        = ghList.toRows("tool", "utility", "manager"),
+                        games        = ghList.toRows("game", "emulat"),
+                        browsers     = ghList.toRows("browser"),
+                        productivity = ghList.toRows("productivity", "note", "office", "task"),
+                        security     = ghList.toRows("security", "privacy", "encrypt"),
+                        devtools     = ghList.toRows("developer", "dev-tool", "terminal", "ssh"),
+                        photoVideo   = ghList.toRows("photo", "camera", "gallery", "image"),
+                        music        = ghList.toRows("music", "podcast", "radio"),
+                        finance      = ghList.toRows("finance", "banking", "budget", "money"),
+                        education    = ghList.toRows("education", "learn", "study", "language"),
+                        fitness      = ghList.toRows("fitness", "health", "workout", "exercise"),
+                        artDesign    = ghList.toRows("art", "design", "draw", "creative"),
+                        news         = ghList.toRows("news", "rss", "feed", "reader"),
+                        social       = ghList.toRows("social", "messag", "chat", "network"),
+                        cloudStorage = ghList.toRows("cloud", "storage", "backup", "sync"),
+                        cooking      = ghList.toRows("cooking", "food", "recipe")
                     )
+                } else {
+                    state.copy(isLoading = false)
                 }
-                state = ns
             } catch (e: Exception) {
                 state = state.copy(isLoading = false)
                 if (e is kotlinx.coroutines.CancellationException) throw e
