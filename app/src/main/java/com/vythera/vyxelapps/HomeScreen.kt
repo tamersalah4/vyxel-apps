@@ -10,14 +10,21 @@ import androidx.compose.animation.AnimatedContent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.EaseOutQuart
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
@@ -100,41 +107,63 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                 "a1_100" to safe(android.R.color.system_accent1_100),
                 "a1_200" to safe(android.R.color.system_accent1_200),
                 "a1_300" to safe(android.R.color.system_accent1_300),
-                "a1_400" to safe(android.R.color.system_accent1_400),
                 "a1_600" to safe(android.R.color.system_accent1_600),
                 "a1_700" to safe(android.R.color.system_accent1_700),
                 "a1_900" to safe(android.R.color.system_accent1_900),
                 "a2_200" to safe(android.R.color.system_accent2_200),
-                "a2_400" to safe(android.R.color.system_accent2_400),
                 "a2_600" to safe(android.R.color.system_accent2_600),
+                "a3_100" to safe(android.R.color.system_accent3_100),
+                "a3_200" to safe(android.R.color.system_accent3_200),
+                "a3_600" to safe(android.R.color.system_accent3_600),
+                "a3_700" to safe(android.R.color.system_accent3_700),
+                "n1_50"  to safe(android.R.color.system_neutral1_50),
+                "n1_100" to safe(android.R.color.system_neutral1_100),
                 "n1_800" to safe(android.R.color.system_neutral1_800),
                 "n1_900" to safe(android.R.color.system_neutral1_900),
             )
         }
     } else emptyMap()
 
+    val useMonetEffective = state.useMonet ||
+        (state.settings.followSystemMonet && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+
     val theme: AppThemeColors = run {
         val manualAccent = state.accentColor
-        if (state.useMonet && monetPalette.isNotEmpty()) {
+        if (useMonetEffective && monetPalette.isNotEmpty()) {
             val dark = baseTheme.isDark
-            // M3 tonal mapping: dark themes use lighter tones on dark bg, light themes use darker tones
-            val primary    = manualAccent ?: if (dark) monetPalette["a1_200"] else monetPalette["a1_600"]
-            val secondary  = if (dark) monetPalette["a2_200"] else monetPalette["a2_600"]
+            val primary   = manualAccent ?: if (dark) monetPalette["a1_200"] else monetPalette["a1_600"]
+            val secondary = if (dark) monetPalette["a2_200"] else monetPalette["a2_600"]
+            val tertiary  = if (dark) monetPalette["a3_200"] else monetPalette["a3_600"]
+            val tertiaryContainer = if (dark) monetPalette["a3_700"] else monetPalette["a3_100"]
             val container  = if (dark) monetPalette["a1_700"] else monetPalette["a1_100"]
             val onContainer= if (dark) monetPalette["a1_100"] else monetPalette["a1_900"]
             baseTheme.copy(
-                accent            = primary      ?: baseTheme.accent,
-                accentAlt         = secondary    ?: baseTheme.accentAlt,
-                accentContainer   = container    ?: baseTheme.accentContainer,
-                onAccentContainer = onContainer  ?: baseTheme.onAccentContainer,
-                dockForeground    = (primary     ?: baseTheme.accent)
+                accent                  = primary               ?: baseTheme.accent,
+                accentAlt               = secondary             ?: baseTheme.accentAlt,
+                accentContainer         = container             ?: baseTheme.accentContainer,
+                onAccentContainer       = onContainer           ?: baseTheme.onAccentContainer,
+                accentTertiary          = tertiary              ?: baseTheme.accentTertiary,
+                accentTertiaryContainer = tertiaryContainer     ?: baseTheme.accentTertiaryContainer,
+                dockForeground          = (primary              ?: baseTheme.accent),
+                bgPrimary               = (if (dark) monetPalette["n1_900"] else monetPalette["n1_50"])  ?: baseTheme.bgPrimary,
+                bgSurface               = (if (dark) monetPalette["n1_900"] else monetPalette["n1_100"]) ?: baseTheme.bgSurface,
+                bgSurfaceAlt            = (if (dark) monetPalette["n1_800"] else monetPalette["n1_100"]) ?: baseTheme.bgSurfaceAlt,
+                bgSurfaceHigh           = (if (dark) monetPalette["n1_800"] else monetPalette["n1_100"]) ?: baseTheme.bgSurfaceHigh
             )
         } else {
             val eff = manualAccent ?: baseTheme.accent
             baseTheme.copy(accent = eff, dockForeground = eff)
         }
     }
-    val fontFamily = remember(state.settings.fontName) { fontFamilyFor(state.settings.fontName.ifEmpty { "Default" }) }
+    var fontFamily by remember(state.settings.fontName) {
+        mutableStateOf(fontFamilyFor(state.settings.fontName.ifEmpty { "Default" }))
+    }
+    LaunchedEffect(state.settings.fontName) {
+        val name = state.settings.fontName.ifEmpty { "Default" }
+        if (name in googleFontNames) {
+            fontFamily = loadGoogleFont(context, name)
+        }
+    }
 
     if (!view.isInEditMode) {
         SideEffect {
@@ -188,8 +217,43 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
     }
 
     CompositionLocalProvider(LocalTheme provides theme, LocalStrings provides stringsForLanguage(state.settings.language)) {
+        val m3Colors = if (theme.isDark) darkColorScheme(
+            primary              = theme.accent,
+            primaryContainer     = theme.accentContainer,
+            onPrimaryContainer   = theme.onAccentContainer,
+            secondary            = theme.accentAlt,
+            tertiary             = theme.accentTertiary,
+            tertiaryContainer    = theme.accentTertiaryContainer,
+            surface              = theme.bgSurface,
+            surfaceContainer     = theme.bgSurfaceAlt,
+            surfaceContainerHigh = theme.bgSurfaceHigh,
+            background           = theme.bgPrimary,
+            onBackground         = theme.textPrimary,
+            onSurface            = theme.textPrimary,
+            onSurfaceVariant     = theme.textSecondary,
+            outline              = theme.border,
+            outlineVariant       = theme.borderVariant
+        ) else lightColorScheme(
+            primary              = theme.accent,
+            primaryContainer     = theme.accentContainer,
+            onPrimaryContainer   = theme.onAccentContainer,
+            secondary            = theme.accentAlt,
+            tertiary             = theme.accentTertiary,
+            tertiaryContainer    = theme.accentTertiaryContainer,
+            surface              = theme.bgSurface,
+            surfaceContainer     = theme.bgSurfaceAlt,
+            surfaceContainerHigh = theme.bgSurfaceHigh,
+            background           = theme.bgPrimary,
+            onBackground         = theme.textPrimary,
+            onSurface            = theme.textPrimary,
+            onSurfaceVariant     = theme.textSecondary,
+            outline              = theme.border,
+            outlineVariant       = theme.borderVariant
+        )
+
         MaterialTheme(
-            typography = MaterialTheme.typography.run {
+            colorScheme = m3Colors,
+            typography  = MaterialTheme.typography.run {
                 copy(
                     displayLarge   = displayLarge.copy(fontFamily   = fontFamily),
                     displayMedium  = displayMedium.copy(fontFamily  = fontFamily),
@@ -209,23 +273,23 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                 )
             }
         ) {
+            // Hoist screen state so bottomBar can read it
+            var lastRepo by remember { mutableStateOf<GitHubRepo?>(null) }
+            if (selectedRepo != null) lastRepo = selectedRepo
+
+            val currentScreen = when {
+                showCompare -> "COMPARE"
+                selectedRepo != null -> "DETAIL"
+                showSeeAll -> "SEE_ALL"
+                else -> "TABS"
+            }
+
             Scaffold(
-                containerColor      = theme.bgPrimary,
+                containerColor      = Color.Transparent,
                 contentWindowInsets = WindowInsets(0)
             ) { _ ->
 
-                // Holds the last non-null repo so exit animations still have content to render
-                var lastRepo by remember { mutableStateOf<GitHubRepo?>(null) }
-                if (selectedRepo != null) lastRepo = selectedRepo
-
-                val currentScreen = when {
-                    showCompare -> "COMPARE"
-                    selectedRepo != null -> "DETAIL"
-                    showSeeAll -> "SEE_ALL"
-                    else -> "TABS"
-                }
-
-                Box(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
 
                     AnimatedContent(
                         targetState  = currentScreen,
@@ -263,48 +327,67 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                                 if (repo != null) {
                                     val installState = state.installStates[repo.id] ?: InstallState()
                                     AppDetailScreen(
-                                        repo              = repo,
-                                        installState      = installState,
-                                        isFavourite       = state.favourites.any { f -> f.id == repo.id },
-                                        translatedDesc    = state.translatedDescriptions[repo.id],
-                                        isTranslating     = state.isTranslating[repo.id] ?: false,
-                                        state             = state,
-                                        screenshots       = state.screenshots[repo.id] ?: emptyList(),
-                                        onInstall         = { installState.apkAsset?.let { a -> viewModel.downloadAndInstall(repo, a) } },
-                                        onDownloadOnly    = { installState.apkAsset?.let { a -> viewModel.downloadOnly(repo, a) } },
-                                        onUninstall       = { viewModel.uninstall(repo) },
-                                        onCancelDownload  = { viewModel.cancelDownload(repo) },
-                                        onTranslate       = { viewModel.translateDescription(repo) },
-                                        onToggleFavourite = { viewModel.toggleFavourite(repo) },
-                                        onIgnoreVersion   = {
+                                        repo                  = repo,
+                                        installState          = installState,
+                                        isFavourite           = state.favourites.any { f -> f.id == repo.id },
+                                        translatedDesc        = state.translatedDescriptions[repo.id],
+                                        isTranslating         = state.isTranslating[repo.id] ?: false,
+                                        translatedReleaseBody = state.translatedReleaseBodies[repo.id],
+                                        isTranslatingRelease  = state.isTranslatingRelease[repo.id] ?: false,
+                                        state                 = state,
+                                        screenshots           = state.screenshots[repo.id] ?: emptyList(),
+                                        onInstall             = { installState.apkAsset?.let { a -> viewModel.downloadAndInstall(repo, a) } },
+                                        onDownloadOnly        = { installState.apkAsset?.let { a -> viewModel.downloadOnly(repo, a) } },
+                                        onUninstall           = { viewModel.uninstall(repo) },
+                                        onCancelDownload      = { viewModel.cancelDownload(repo) },
+                                        onTranslate           = { viewModel.translateDescription(repo) },
+                                        onTranslateRelease    = { viewModel.translateReleaseBody(repo) },
+                                        onToggleFavourite     = { viewModel.toggleFavourite(repo) },
+                                        onIgnoreVersion       = {
                                             installState.release?.tag_name?.let { viewModel.ignoreVersion(repo.id, it) }
                                         },
-                                        onCompare         = { showCompare = true },
-                                        onBack            = { viewModel.refreshInstall(repo.id); selectedRepo = null }
+                                        onCompare             = { showCompare = true },
+                                        onSelectRelease       = { rel -> viewModel.selectRelease(repo.id, rel) },
+                                        onSelectAsset         = { asset -> viewModel.selectAsset(repo.id, asset) },
+                                        onBack                = { viewModel.refreshInstall(repo.id); selectedRepo = null }
                                     )
                                 }
                             }
 // ── See All ───────────────────────────────────
                             "SEE_ALL" -> SeeAllScreen(
-                                title      = state.seeAllTitle,
-                                apps       = state.seeAllApps,
-                                installed  = installedSet,
-                                isLoading  = state.isLoadingSeeAll,
-                                onLoadMore = { viewModel.loadMoreSeeAll() },
-                                onAppClick = { r -> viewModel.addToHistory(r); selectedRepo = r },
-                                onBack     = { showSeeAll = false }
+                                title         = state.seeAllTitle,
+                                apps          = state.seeAllApps,
+                                installed     = installedSet,
+                                isLoading     = state.isLoadingSeeAll,
+                                useTileColors = true,
+                                onLoadMore    = { viewModel.loadMoreSeeAll() },
+                                onAppClick    = { r -> viewModel.addToHistory(r); selectedRepo = r },
+                                onBack        = { showSeeAll = false }
                             )
 // ── Tabs ──────────────────────────────────────
-                            else -> AnimatedContent(
+                            else -> Box(modifier = Modifier.fillMaxSize()) {
+                             AnimatedContent(
                                 targetState = selectedTab,
                                 transitionSpec = {
-                                    val goingRight = targetState.ordinal > initialState.ordinal
-                                    if (goingRight) {
-                                        (slideInHorizontally(tween(280)) { it } + fadeIn(tween(200))) togetherWith
-                                                (slideOutHorizontally(tween(280)) { -it } + fadeOut(tween(160)))
-                                    } else {
-                                        (slideInHorizontally(tween(280)) { -it } + fadeIn(tween(200))) togetherWith
-                                                (slideOutHorizontally(tween(280)) { it } + fadeOut(tween(160)))
+                                    val toSearch   = targetState  == VAppTab.SEARCH
+                                    val fromSearch = initialState == VAppTab.SEARCH
+                                    when {
+                                        // HOME → SEARCH: home drifts up, search rises from below
+                                        toSearch   -> (slideInVertically(tween(420, easing = EaseOutQuart)) { it / 4 } + fadeIn(tween(360, easing = FastOutSlowInEasing))) togetherWith
+                                                      (slideOutVertically(tween(380, easing = FastOutSlowInEasing)) { -it / 4 } + fadeOut(tween(300, easing = FastOutSlowInEasing)))
+                                        // SEARCH → HOME: gentle reverse
+                                        fromSearch -> (slideInVertically(tween(420, easing = EaseOutQuart)) { -it / 4 } + fadeIn(tween(360, easing = FastOutSlowInEasing))) togetherWith
+                                                      (slideOutVertically(tween(380, easing = FastOutSlowInEasing)) { it / 4 } + fadeOut(tween(300, easing = FastOutSlowInEasing)))
+                                        else -> {
+                                            val goingRight = targetState.ordinal > initialState.ordinal
+                                            if (goingRight) {
+                                                (slideInHorizontally(tween(280)) { it } + fadeIn(tween(200))) togetherWith
+                                                        (slideOutHorizontally(tween(280)) { -it } + fadeOut(tween(160)))
+                                            } else {
+                                                (slideInHorizontally(tween(280)) { -it } + fadeIn(tween(200))) togetherWith
+                                                        (slideOutHorizontally(tween(280)) { it } + fadeOut(tween(160)))
+                                            }
+                                        }
                                     }
                                 },
                                 label = "tab_switch"
@@ -317,7 +400,9 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                                         listState      = homeListState,
                                         onAppClick     = { r -> viewModel.addToHistory(r); selectedRepo = r },
                                         onSeeAll       = { showSeeAll = true },
-                                        onScrollChange = { scrolling -> dockVisible = !scrolling }
+                                        onSearchClick  = { selectedTab = VAppTab.SEARCH },
+                                        onScrollChange = { scrolling -> dockVisible = !scrolling },
+                                        onProfileClick = { selectedTab = VAppTab.PROFILE}
                                     )
                                     VAppTab.SEARCH -> SearchScreen(
                                         query                 = state.searchQuery,
@@ -342,6 +427,8 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                                         updates           = state.updates,
                                         onAppClick        = { r -> selectedRepo = r },
                                         onCheckUpdates    = { viewModel.checkForUpdatesNow() },
+                                        onUpdateAll       = { viewModel.updateAll() },
+                                        onClearRemoved    = { viewModel.clearRemovedApps() },
                                         isCheckingUpdates = state.isCheckingUpdates
                                     )
                                     VAppTab.PROFILE -> ProfileScreen(
@@ -367,35 +454,86 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
                                     )
                                 }
                             }
+                            } // end Box(paddingValues)
                         }
                     }
 
-                    // ── Floating dock ─────────────────────────────────
-                    if (selectedRepo == null && !showSeeAll && !showCompare) {
-                        AnimatedVisibility(
-                            visible  = dockVisible,
-                            enter    = slideInVertically(tween(220)) { it } + fadeIn(tween(180)),
-                            exit     = slideOutVertically(tween(180)) { it } + fadeOut(tween(140)),
-                            modifier = Modifier.align(Alignment.BottomCenter)
+                    // Reset dock visibility when sub-screens open
+                    LaunchedEffect(selectedRepo, showSeeAll, showCompare) {
+                        if (selectedRepo != null || showSeeAll || showCompare) dockVisible = true
+                    }
+
+                    // ── Floating dock overlay ──────────────────────────
+                    AnimatedVisibility(
+                        visible  = dockVisible && currentScreen == "TABS",
+                        modifier = Modifier.align(Alignment.BottomCenter),
+                        enter    = slideInVertically(tween(220)) { it } + fadeIn(tween(180)),
+                        exit     = slideOutVertically(tween(180)) { it } + fadeOut(tween(140))
+                    ) {
+                        FloatingNavBar(
+                            selectedTab = selectedTab,
+                            updateCount = state.updates.size,
+                            onTabSelect = { tab ->
+                                selectedTab  = tab
+                                selectedRepo = null
+                                showSeeAll   = false
+                                dockVisible  = true
+                            }
+                        )
+                    }
+
+                    // ── Self-update banner ─────────────────────────────
+                    val selfUpdate = state.selfUpdateInfo
+                    if (selfUpdate != null && !state.selfUpdateDismissed) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .statusBarsPadding()
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .navigationBarsPadding()
-                                    .padding(bottom = 8.dp),
-                                contentAlignment = Alignment.BottomCenter
+                            ElevatedCard(
+                                shape     = MaterialTheme.shapes.large,
+                                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp),
+                                colors    = CardDefaults.elevatedCardColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                                ),
+                                modifier  = Modifier.fillMaxWidth()
                             ) {
-                                FloatingNavBar(
-                                    selectedTab = selectedTab,
-                                    theme       = theme,
-                                    updateCount = state.updates.size,
-                                    onTabSelect = { VApptab ->
-                                        selectedTab  = VApptab
-                                        selectedRepo = null
-                                        showSeeAll   = false
-                                        dockVisible  = true
+                                Row(
+                                    modifier          = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Update available: ${selfUpdate.latestVersion}",
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            style = MaterialTheme.typography.labelLarge
+                                        )
+                                        if (selfUpdate.changelog.isNotBlank()) {
+                                            Text(
+                                                selfUpdate.changelog.lines().firstOrNull()?.take(60) ?: "",
+                                                color    = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                                                style    = MaterialTheme.typography.labelSmall,
+                                                maxLines = 1
+                                            )
+                                        }
                                     }
-                                )
+                                    Spacer(Modifier.width(8.dp))
+                                    FilledTonalButton(onClick = {
+                                        val intent = android.content.Intent(
+                                            android.content.Intent.ACTION_VIEW,
+                                            android.net.Uri.parse(selfUpdate.apkUrl)
+                                        )
+                                        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        context.startActivity(intent)
+                                    }) {
+                                        Text("Update")
+                                    }
+                                    IconButton(onClick = { viewModel.dismissSelfUpdate() }) {
+                                        Icon(Icons.Rounded.Close, contentDescription = "Dismiss", tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    }
+                                }
                             }
                         }
                     }
@@ -413,10 +551,12 @@ fun HomeScreen(viewModel: AppViewModel = viewModel()) {
 fun HomeTab(
     state          : UiState,
     viewModel      : AppViewModel,
+    onProfileClick: () -> Unit,
     installed      : Set<Long>,
     listState      : LazyListState,
     onAppClick     : (GitHubRepo) -> Unit,
     onSeeAll       : () -> Unit,
+    onSearchClick  : () -> Unit        = {},
     onScrollChange : (Boolean) -> Unit = {}
 ) {
     val theme = LocalTheme.current
@@ -454,6 +594,8 @@ fun HomeTab(
         onSeeAll()
     }
 
+    Box(modifier = Modifier.fillMaxSize().background(theme.bgPrimary)) {
+        ScreenBackground(ScreenBg.HOME)
     PullToRefreshBox(
         isRefreshing = isRefreshing,
         onRefresh = {
@@ -463,42 +605,54 @@ fun HomeTab(
         },
         modifier = Modifier.fillMaxSize()
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            LazyColumn(
-                state          = listState,
-                modifier       = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 180.dp)
-            ) {
-
-                if (state.trending.isNotEmpty()) {
-                    item(key = "hero_banner") {
-                        HeroBanner(apps = state.trending, onAppClick = onAppClick)
-                    }
-                }
-
-                item(key = "collections") {
-                    CollectionsRow { collection ->
-                        viewModel.openCollection(collection)
-                        onSeeAll()
-                    }
-                }
-
-                item(key = "sources") {
-                    SourcesRow(
-                        gitlabCount   = state.gitlabApps.size,
-                        codebergCount = state.codebergApps.size,
-                        fdroidCount   = state.fdroidApps.size,
-                        flathubCount  = state.flathubApps.size,
-                        wingetCount   = state.wingetApps.size,
-                        onSourceClick = { source ->
-                            viewModel.openSourceBrowse(source)
-                            onSeeAll()
+        LazyColumn(
+            state          = listState,
+            modifier       = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 180.dp)
+        ) {
+            item(key = "discover_header") {
+                val notifications = remember(state.updates, state.installHistory) {
+                    buildList {
+                        state.updates.take(5).forEach { u ->
+                            add(AppNotification(
+                                title = "Update available: ${u.repoName}",
+                                body  = "${u.currentTag} → ${u.latestTag}",
+                                type  = NotifType.UPDATE
+                            ))
                         }
-                    )
+                        state.installHistory
+                            .sortedByDescending { it.installedAt }
+                            .take(4)
+                            .forEach { entry ->
+                                add(AppNotification(
+                                    title = "Installed ${entry.repoName}",
+                                    body  = "Version ${entry.tagName}",
+                                    type  = NotifType.INSTALL
+                                ))
+                            }
+                    }
                 }
-
-// Collections row — add this right after banner
-
+                DiscoverHeader(
+                    profile         = state.profile,
+                    notifications   = notifications,
+                    notifsDismissed = state.notifsDismissed,
+                    onClearAll      = { viewModel.clearNotifications() },
+                    onProfileClick  = onProfileClick
+                )
+            }
+            item(key = "search_bar") {
+                HomeSearchBar(
+                    onSearchClick = onSearchClick,
+                    modifier      = Modifier.offset(y = (-8).dp)
+                )
+            }
+            item(key = "source_chips") {
+                HomeSourceChipsRow(
+                    selectedSource = state.selectedSource,
+                    onSourceSelect = { viewModel.setSourceFilter(it) },
+                    modifier       = Modifier.padding(top = 8.dp, bottom = 8.dp)
+                )
+            }
 
                 if (state.error != null) {
                     item(key = "error") { ErrorPlaceholder(state.error) { viewModel.loadAll() } }
@@ -518,188 +672,151 @@ fun HomeTab(
                 } else if (state.isLoading) {
                     item(key = "loading") { LoadingPlaceholder() }
                 } else {
-                    if (state.recommendations.isNotEmpty()) {
-                        item(key = "recs") {
-                            AppRow(
-                                strings.sectionRecommended,
-                                state.recommendations,
-                                installed
-                            ) { onAppClick(it) }
+                    // Hero banner, collections, sources — hidden when a source filter is active
+                    item(key = "featured") {
+                        AnimatedVisibility(
+                            visible = state.selectedSource == null,
+                            enter   = expandVertically(tween(420)) + fadeIn(tween(300, delayMillis = 80)),
+                            exit    = slideOutVertically(tween(320)) { -it / 3 } + shrinkVertically(tween(360)) + fadeOut(tween(260))
+                        ) {
+                            val featuredPool = remember(
+                                state.trending, state.fdroidApps, state.gitlabApps,
+                                state.codebergApps, state.flathubApps, state.wingetApps
+                            ) {
+                                (state.trending + state.fdroidApps + state.gitlabApps +
+                                 state.codebergApps + state.flathubApps + state.wingetApps)
+                                    .filter { it.owner.avatar_url.isNotEmpty() }
+                                    .shuffled()
+                            }
+                            FeaturedCard(apps = featuredPool, onAppClick = onAppClick)
                         }
                     }
-                    item(key = "r1") {
-                        AppRow(
-                            title = strings.sectionTrending,
-                            apps = state.trending,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
+                    item(key = "collections") {
+                        AnimatedVisibility(
+                            visible = state.selectedSource == null,
+                            enter   = expandVertically(tween(400)) + fadeIn(tween(300, delayMillis = 40)),
+                            exit    = slideOutVertically(tween(280)) { -it / 3 } + shrinkVertically(tween(330)) + fadeOut(tween(230))
+                        ) {
+                            CollectionsRow { collection ->
+                                viewModel.openCollection(collection)
+                                onSeeAll()
+                            }
+                        }
                     }
-                    item(key = "r2") {
-                        AppRow(
-                            title = strings.sectionMedia,
-                            apps = state.media,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
+                    item(key = "sources") {
+                        AnimatedVisibility(
+                            visible = state.selectedSource == null,
+                            enter   = expandVertically(tween(380)) + fadeIn(tween(280)),
+                            exit    = slideOutVertically(tween(240)) { -it / 3 } + shrinkVertically(tween(300)) + fadeOut(tween(200))
+                        ) {
+                            SourcesRow(
+                                gitlabCount   = state.gitlabApps.size,
+                                codebergCount = state.codebergApps.size,
+                                fdroidCount   = state.fdroidApps.size,
+                                flathubCount  = state.flathubApps.size,
+                                wingetCount   = state.wingetApps.size,
+                                izzyCount     = state.izzyApps.size,
+                                onSourceClick = { source ->
+                                    viewModel.openSourceBrowse(source)
+                                    onSeeAll()
+                                }
+                            )
+                        }
                     }
-                    item(key = "r3") {
-                        AppRow(
-                            title = strings.sectionTools,
-                            apps = state.tools,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r4") {
-                        AppRow(
-                            title = strings.sectionGames,
-                            apps = state.games,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r5") {
-                        AppRow(
-                            title = strings.sectionBrowsers,
-                            apps = state.browsers,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r6") {
-                        AppRow(
-                            title = strings.sectionProductivity,
-                            apps = state.productivity,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r7") {
-                        AppRow(
-                            title = strings.sectionSecurity,
-                            apps = state.security,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r8") {
-                        AppRow(
-                            title = strings.sectionDevTools,
-                            apps = state.devtools,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r9") {
-                        AppRow(
-                            title = strings.sectionPhotoVideo,
-                            apps = state.photoVideo,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r10") {
-                        AppRow(
-                            title = strings.sectionMusic,
-                            apps = state.music,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r11") {
-                        AppRow(
-                            title = strings.sectionFinance,
-                            apps = state.finance,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r12") {
-                        AppRow(
-                            title = strings.sectionEducation,
-                            apps = state.education,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r13") {
-                        AppRow(
-                            title = strings.sectionFitness,
-                            apps = state.fitness,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r14") {
-                        AppRow(
-                            title = strings.sectionArtDesign,
-                            apps = state.artDesign,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r15") {
-                        AppRow(
-                            title = strings.sectionNews,
-                            apps = state.news,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r16") {
-                        AppRow(
-                            title = strings.sectionSocial,
-                            apps = state.social,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r17") {
-                        AppRow(
-                            title = strings.sectionCloudStorage,
-                            apps = state.cloudStorage,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    item(key = "r18") {
-                        AppRow(
-                            title = strings.sectionCooking,
-                            apps = state.cooking,
-                            installed = installed,
-                            refreshToken = state.refreshToken,
-                            onAppClick = { repo -> onAppClick(repo) }
-                        )
-                    }
-                    if (state.isLoadingMore) {
-                        item(key = "load_more") {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().padding(20.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                CircularProgressIndicator(
-                                    color = theme.accent,
-                                    modifier = Modifier.size(24.dp),
-                                    strokeWidth = 2.dp
-                                )
+                    // App cards filtered by the selected source chip
+                    when (state.selectedSource) {
+                        AppSource.FDROID -> item(key = "fdroid_apps") {
+                            AppRow("F-Droid Apps", state.fdroidApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        AppSource.GITLAB -> item(key = "gitlab_apps") {
+                            AppRow("GitLab Apps", state.gitlabApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        AppSource.CODEBERG -> item(key = "codeberg_apps") {
+                            AppRow("Codeberg Apps", state.codebergApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        AppSource.FLATHUB -> item(key = "flathub_apps") {
+                            AppRow("Flathub Apps", state.flathubApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        AppSource.WINGET -> item(key = "winget_apps") {
+                            AppRow("Winget Apps", state.wingetApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        AppSource.IZZY -> item(key = "izzy_apps") {
+                            AppRow("IzzyOnDroid Apps", state.izzyApps, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                        }
+                        else -> {
+                            // null (All Sources) or GITHUB — show all GitHub-backed rows
+                            if (state.recommendations.isNotEmpty()) {
+                                item(key = "recs") {
+                                    AppRow(strings.sectionRecommended, state.recommendations, installed) { onAppClick(it) }
+                                }
+                            }
+                            item(key = "r1") {
+                                AppRow(strings.sectionTrending, state.trending, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r2") {
+                                AppRow(strings.sectionMedia, state.media, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r3") {
+                                AppRow(strings.sectionTools, state.tools, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r4") {
+                                AppRow(strings.sectionGames, state.games, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r5") {
+                                AppRow(strings.sectionBrowsers, state.browsers, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r6") {
+                                AppRow(strings.sectionProductivity, state.productivity, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r7") {
+                                AppRow(strings.sectionSecurity, state.security, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r8") {
+                                AppRow(strings.sectionDevTools, state.devtools, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r9") {
+                                AppRow(strings.sectionPhotoVideo, state.photoVideo, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r10") {
+                                AppRow(strings.sectionMusic, state.music, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r11") {
+                                AppRow(strings.sectionFinance, state.finance, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r12") {
+                                AppRow(strings.sectionEducation, state.education, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r13") {
+                                AppRow(strings.sectionFitness, state.fitness, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r14") {
+                                AppRow(strings.sectionArtDesign, state.artDesign, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r15") {
+                                AppRow(strings.sectionNews, state.news, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r16") {
+                                AppRow(strings.sectionSocial, state.social, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r17") {
+                                AppRow(strings.sectionCloudStorage, state.cloudStorage, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            item(key = "r18") {
+                                AppRow(strings.sectionCooking, state.cooking, installed, refreshToken = state.refreshToken) { onAppClick(it) }
+                            }
+                            if (state.isLoadingMore) {
+                                item(key = "load_more") {
+                                    Box(
+                                        modifier = Modifier.fillMaxWidth().padding(20.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            color = theme.accent,
+                                            modifier = Modifier.size(24.dp),
+                                            strokeWidth = 2.dp
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -707,10 +824,8 @@ fun HomeTab(
             }
 
 
-TopBar(modifier = Modifier.align(Alignment.TopCenter))
-
-        }
     }
+    } // Box
 }
 @Composable
 fun LoadingPlaceholder() {

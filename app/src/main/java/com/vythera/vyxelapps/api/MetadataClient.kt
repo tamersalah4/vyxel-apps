@@ -129,10 +129,11 @@ class MetadataClient(private val context: Context, private val cdnBase: String) 
         return indexCache ?: emptyList()
     }
 
-    private fun cachedFetch(key: String, url: String): String {
-        if (isFresh(key)) loadCache(key)?.let { return it }
-        return fetch(url).also { saveCache(key, it) }
-    }
+    private suspend fun cachedFetch(key: String, url: String): String =
+        withContext(Dispatchers.IO) {
+            if (isFresh(key)) loadCache(key)?.let { return@withContext it }
+            fetch(url).also { saveCache(key, it) }
+        }
 
     private fun fetch(url: String): String =
         URL(url).openStream().bufferedReader().use { it.readText() }

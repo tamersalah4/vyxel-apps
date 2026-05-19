@@ -7,7 +7,13 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -21,18 +27,33 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import androidx.compose.ui.res.painterResource
 import java.io.File
+import kotlin.math.*
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Size
 
 private fun saveImageLocally(context: Context, uri: android.net.Uri, filename: String): String? {
     return try {
@@ -44,23 +65,207 @@ private fun saveImageLocally(context: Context, uri: android.net.Uri, filename: S
     } catch (_: Exception) { null }
 }
 
+private fun saveBitmapLocally(context: Context, bmp: android.graphics.Bitmap, filename: String): String? = try {
+    val file = File(context.filesDir, "$filename.jpg")
+    file.outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, it) }
+    file.absolutePath
+} catch (_: Exception) { null }
+
+private fun cropBitmapFromLayer(
+    source   : android.graphics.Bitmap,
+    screenW  : Int,  screenH  : Int,
+    userScale: Float, offsetX: Float, offsetY: Float,
+    cropLeft : Float, cropTop: Float, cropW: Float, cropH: Float,
+    circular : Boolean
+): android.graphics.Bitmap {
+    val bW = source.width.toFloat()
+    val bH = source.height.toFloat()
+    val fitScale = minOf(screenW / bW, screenH / bH)
+    val totalScale = userScale * fitScale
+    // graphicsLayer pivot = composable center → inverse mapping:
+    // bitmapX = (screenX - screenW/2 - offsetX) / totalScale + bitmapW/2
+    val bLeft = ((cropLeft  - screenW / 2f - offsetX) / totalScale + bW / 2f)
+    val bTop  = ((cropTop   - screenH / 2f - offsetY) / totalScale + bH / 2f)
+    val bCropW = cropW / totalScale
+    val bCropH = cropH / totalScale
+    val clL = bLeft.toInt().coerceIn(0, source.width - 1)
+    val clT = bTop.toInt().coerceIn(0,  source.height - 1)
+    val clW = bCropW.toInt().coerceIn(1, source.width  - clL)
+    val clH = bCropH.toInt().coerceIn(1, source.height - clT)
+    val extracted = android.graphics.Bitmap.createBitmap(source, clL, clT, clW, clH)
+    val outW = if (circular) 512 else 1024; val outH = if (circular) 512 else 512
+    val scaled = android.graphics.Bitmap.createScaledBitmap(extracted, outW, outH, true)
+    return if (!circular) scaled else {
+        val result = android.graphics.Bitmap.createBitmap(outW, outH, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(result)
+        val paint  = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        canvas.drawCircle(outW / 2f, outH / 2f, outW / 2f, paint)
+        paint.xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_IN)
+        canvas.drawBitmap(scaled, 0f, 0f, paint)
+        result
+    }
+}
+
+@Composable
+fun ImageCropDialog(
+    uri      : android.net.Uri,
+    circular : Boolean = true,
+    onSave   : (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    var bmp by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(uri) {
+        bmp = try {
+            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = 2 }
+            context.contentResolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, opts)
+            }
+        } catch (_: Exception) { null }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        val loadedBmp = bmp
+        if (loadedBmp == null) {
+            Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Color.White)
+            }
+            return@Dialog
+        }
+
+        var scale   by remember { mutableFloatStateOf(1f) }
+        var offsetX by remember { mutableFloatStateOf(0f) }
+        var offsetY by remember { mutableFloatStateOf(0f) }
+
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().background(Color.Black)
+        ) {
+            val w = constraints.maxWidth.toFloat()
+            val h = constraints.maxHeight.toFloat()
+            val cropR    = minOf(w, h) * 0.42f
+            val rectW    = w * 0.88f
+            val rectH    = rectW * (9f / 16f)
+            val cropLeft = if (circular) (w - cropR * 2) / 2f else (w - rectW) / 2f
+            val cropTop  = if (circular) (h - cropR * 2) / 2f else (h - rectH) / 2f
+            val cropW    = if (circular) cropR * 2 else rectW
+            val cropH    = if (circular) cropR * 2 else rectH
+
+            // Image with pan + pinch-zoom
+            Image(
+                bitmap             = loadedBmp.asImageBitmap(),
+                contentDescription = null,
+                contentScale       = ContentScale.Fit,
+                modifier           = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            scale   = (scale * zoom).coerceIn(0.3f, 10f)
+                            offsetX += pan.x
+                            offsetY += pan.y
+                        }
+                    }
+                    .graphicsLayer {
+                        scaleX       = scale;  scaleY       = scale
+                        translationX = offsetX; translationY = offsetY
+                    }
+            )
+
+            // Dimmed overlay with transparent crop cutout
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            ) {
+                drawRect(Color.Black.copy(alpha = 0.58f))
+                if (circular) {
+                    drawCircle(Color.Transparent, cropR, blendMode = BlendMode.Clear)
+                    drawCircle(Color.White.copy(0.65f), cropR, style = Stroke(2.dp.toPx()))
+                } else {
+                    drawRect(Color.Transparent,
+                        topLeft = androidx.compose.ui.geometry.Offset(cropLeft, cropTop),
+                        size    = Size(cropW, cropH),
+                        blendMode = BlendMode.Clear)
+                    drawRect(Color.White.copy(0.65f),
+                        topLeft = androidx.compose.ui.geometry.Offset(cropLeft, cropTop),
+                        size    = Size(cropW, cropH),
+                        style   = Stroke(2.dp.toPx()))
+                }
+            }
+
+            // Hint text
+            Text(
+                "Drag and pinch to position",
+                color    = Color.White.copy(0.75f),
+                style    = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 18.dp)
+            )
+
+            // Action buttons
+            Row(
+                modifier              = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(horizontal = 28.dp, vertical = 28.dp)
+                    .fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                OutlinedButton(
+                    onClick  = onDismiss,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    border   = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(0.45f)),
+                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                ) { Text("Cancel") }
+                Button(
+                    onClick  = {
+                        val cropped = cropBitmapFromLayer(
+                            source    = loadedBmp,
+                            screenW   = w.toInt(), screenH = h.toInt(),
+                            userScale = scale, offsetX = offsetX, offsetY = offsetY,
+                            cropLeft  = cropLeft, cropTop = cropTop,
+                            cropW     = cropW,    cropH   = cropH,
+                            circular  = circular
+                        )
+                        val filename = if (circular) "profile_avatar" else "profile_cover"
+                        val path = saveBitmapLocally(context, cropped, filename)
+                        if (path != null) onSave(path)
+                        onDismiss()
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp)
+                ) { Text("Crop & Save") }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SubScreenHeader(title: String, onBack: () -> Unit) {
-    val t = LocalTheme.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(t.bgSurface)
-            .statusBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalAlignment     = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back", tint = t.textPrimary)
-        }
-        Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = t.textPrimary)
-    }
+    TopAppBar(
+        title          = {
+            Text(
+                title,
+                style      = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        navigationIcon = {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
+            }
+        },
+        colors   = TopAppBarDefaults.topAppBarColors(
+            containerColor             = Color.Transparent,
+            titleContentColor          = MaterialTheme.colorScheme.onSurface,
+            navigationIconContentColor = MaterialTheme.colorScheme.onSurface
+        ),
+        modifier = Modifier.statusBarsPadding()
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,19 +293,42 @@ fun ProfileScreen(
     var coverUri by remember { mutableStateOf(profile.coverUri) }
     var editing  by remember { mutableStateOf(false) }
 
+    var cropAvatarUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var cropCoverUri  by remember { mutableStateOf<android.net.Uri?>(null) }
+
     val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        uri?.let { saveImageLocally(context, it, "profile_avatar")?.let { p -> photoUri = p } }
+        uri?.let { cropAvatarUri = it }
     }
     val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        uri?.let { saveImageLocally(context, it, "profile_cover")?.let { p -> coverUri = p } }
+        uri?.let { cropCoverUri = it }
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(t.bgPrimary)) {
+    // Show crop dialogs when URIs are set
+    cropAvatarUri?.let { uri ->
+        ImageCropDialog(
+            uri      = uri,
+            circular = true,
+            onSave   = { path -> photoUri = path },
+            onDismiss = { cropAvatarUri = null }
+        )
+    }
+    cropCoverUri?.let { uri ->
+        ImageCropDialog(
+            uri      = uri,
+            circular = false,
+            onSave   = { path -> coverUri = path },
+            onDismiss = { cropCoverUri = null }
+        )
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        ScreenBackground(ScreenBg.PROFILE)
+    Column(modifier = Modifier.fillMaxSize()) {
         // Header
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(t.bgSurface)
+                .background(Color.Transparent)
                 .statusBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
@@ -109,7 +337,7 @@ fun ProfileScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment     = Alignment.CenterVertically
             ) {
-                Text(s.profileTitle, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = t.textPrimary)
+                Text(s.profileTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                 TextButton(onClick = {
                     if (editing) {
                         onSave(UserProfile(name, "", email, photoUri, coverUri))
@@ -118,7 +346,7 @@ fun ProfileScreen(
                 }) {
                     Text(
                         if (editing) s.save else s.edit,
-                        color      = t.accent,
+                        style      = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -127,9 +355,16 @@ fun ProfileScreen(
 
         LazyColumn(contentPadding = PaddingValues(bottom = 110.dp)) {
 
-            // Cover + Avatar
+            // Cover + Avatar + Identity (avatar and name sit inside the cover, vertically centered left)
             item {
-                Box(modifier = Modifier.fillMaxWidth().height(180.dp)) {
+                Box(
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp)
+                        .fillMaxWidth()
+                        .height(190.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                ) {
+                    // Background: cover image or M3 Expressive gradient
                     if (coverUri.isNotEmpty()) {
                         AsyncImage(
                             model              = coverUri,
@@ -137,131 +372,144 @@ fun ProfileScreen(
                             modifier           = Modifier.fillMaxSize(),
                             contentScale       = ContentScale.Crop
                         )
-                        Box(Modifier.fillMaxSize().background(Color.Black.copy(0.3f)))
+                        Box(Modifier.fillMaxSize().background(Color.Black.copy(0.38f)))
                     } else {
-                        // M3 tonal gradient — uses accent, not random vivid colors
                         Box(
                             Modifier.fillMaxSize().background(
                                 Brush.linearGradient(
-                                    listOf(t.accentContainer, t.bgSurfaceHigh)
+                                    listOf(
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                                        MaterialTheme.colorScheme.secondary.copy(alpha = 0.70f),
+                                        MaterialTheme.colorScheme.tertiary.copy(alpha = 0.60f)
+                                    )
                                 )
                             )
                         )
                     }
-                    if (editing) {
-                        Surface(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(10.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable {
-                                    coverPicker.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                    )
-                                },
-                            shape = RoundedCornerShape(20.dp),
-                            color = Color.Black.copy(0.45f)
-                        ) {
-                            Text(
-                                "Change Cover",
-                                fontSize = 12.sp,
-                                color    = Color.White,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                            )
-                        }
-                    }
-                    // Avatar
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .padding(start = 20.dp)
-                            .offset(y = 36.dp)
-                            .size(72.dp)
-                            .clip(CircleShape)
-                            .background(t.bgSurface)
-                            .border(3.dp, t.bgSurface, CircleShape),
-                        contentAlignment = Alignment.Center
+
+                    // Avatar + identity Row, vertically centered on the left
+                    Row(
+                        modifier              = Modifier
+                            .align(Alignment.CenterStart)
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment     = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        if (photoUri.isNotEmpty()) {
-                            AsyncImage(
-                                model              = photoUri,
-                                contentDescription = null,
-                                modifier           = Modifier.fillMaxSize().clip(CircleShape),
-                                contentScale       = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(
-                                Icons.Rounded.Person,
-                                null,
-                                tint     = t.textSecondary,
-                                modifier = Modifier.size(36.dp)
-                            )
+                        Box(
+                            modifier = Modifier
+                                .size(88.dp)
+                                .clip(CircleShape)
+                                .background(Color.White.copy(0.15f))
+                                .border(2.dp, Color.White.copy(0.50f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (photoUri.isNotEmpty()) {
+                                AsyncImage(
+                                    model              = photoUri,
+                                    contentDescription = null,
+                                    modifier           = Modifier.fillMaxSize().clip(CircleShape),
+                                    contentScale       = ContentScale.Crop
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Rounded.Person,
+                                    null,
+                                    tint     = Color.White,
+                                    modifier = Modifier.size(44.dp)
+                                )
+                            }
+                            if (editing) {
+                                Box(
+                                    Modifier.fillMaxSize().clip(CircleShape)
+                                        .background(Color.Black.copy(0.4f))
+                                        .clickable {
+                                            avatarPicker.launch(
+                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                            )
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.Rounded.Edit, null, tint = Color.White, modifier = Modifier.size(20.dp))
+                                }
+                            }
                         }
-                        if (editing) {
-                            Box(
-                                Modifier.fillMaxSize().clip(CircleShape)
-                                    .background(Color.Black.copy(0.4f))
-                                    .clickable {
-                                        avatarPicker.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Rounded.Edit, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                        if (!editing) {
+                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                Text(
+                                    name.ifEmpty { s.guestUser },
+                                    style      = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color      = Color.White,
+                                    maxLines   = 1,
+                                    overflow   = TextOverflow.Ellipsis
+                                )
+                                if (email.isNotEmpty()) {
+                                    Text(
+                                        email,
+                                        style    = MaterialTheme.typography.labelMedium,
+                                        color    = Color.White.copy(0.80f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     }
-                }
-                Spacer(Modifier.height(44.dp))
-            }
 
-            // Name + Email
-            item {
-                Column(
-                    modifier            = Modifier.padding(horizontal = 20.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
+                    // Change cover button (edit mode only)
                     if (editing) {
+                        FilledTonalButton(
+                            onClick   = {
+                                coverPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                            modifier  = Modifier.align(Alignment.TopEnd).padding(10.dp),
+                            shape     = MaterialTheme.shapes.extraLarge,
+                            colors    = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = Color.Black.copy(0.45f),
+                                contentColor   = Color.White
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("Change Cover", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                if (editing) {
+                    Column(
+                        modifier            = Modifier.padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
                         TextField(
                             value            = name,
                             onValueChange    = { name = it },
-                            modifier         = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
-                            placeholder      = { Text(s.displayName, color = t.textSecondary) },
+                            modifier         = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium),
+                            placeholder      = { Text(s.displayName, style = MaterialTheme.typography.bodyMedium) },
                             singleLine       = true,
                             colors           = TextFieldDefaults.colors(
-                                focusedContainerColor   = t.bgSurfaceAlt,
-                                unfocusedContainerColor = t.bgSurfaceAlt,
-                                focusedIndicatorColor   = t.accent,
+                                focusedContainerColor   = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                focusedIndicatorColor   = MaterialTheme.colorScheme.primary,
                                 unfocusedIndicatorColor = Color.Transparent,
-                                focusedTextColor        = t.textPrimary,
-                                unfocusedTextColor      = t.textPrimary
+                                focusedTextColor        = MaterialTheme.colorScheme.onSurface,
+                                unfocusedTextColor      = MaterialTheme.colorScheme.onSurface
                             )
                         )
                         TextField(
                             value            = email,
                             onValueChange    = { email = it },
-                            modifier         = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
-                            placeholder      = { Text(s.emailAddress, color = t.textSecondary) },
+                            modifier         = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium),
+                            placeholder      = { Text(s.emailAddress, style = MaterialTheme.typography.bodyMedium) },
                             singleLine       = true,
                             colors           = TextFieldDefaults.colors(
-                                focusedContainerColor   = t.bgSurfaceAlt,
-                                unfocusedContainerColor = t.bgSurfaceAlt,
-                                focusedIndicatorColor   = t.accent,
+                                focusedContainerColor   = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                focusedIndicatorColor   = MaterialTheme.colorScheme.primary,
                                 unfocusedIndicatorColor = Color.Transparent,
-                                focusedTextColor        = t.textPrimary,
-                                unfocusedTextColor      = t.textPrimary
+                                focusedTextColor        = MaterialTheme.colorScheme.onSurface,
+                                unfocusedTextColor      = MaterialTheme.colorScheme.onSurface
                             )
                         )
-                    } else {
-                        Text(
-                            name.ifEmpty { s.guestUser },
-                            fontSize   = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color      = t.textPrimary
-                        )
-                        if (email.isNotEmpty())
-                            Text(email, fontSize = 13.sp, color = t.textSecondary)
                     }
                 }
             }
@@ -269,21 +517,21 @@ fun ProfileScreen(
             // Support & Feedback
             item {
                 Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp)) {
-                    HorizontalDivider(color = t.borderVariant)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     Spacer(Modifier.height(12.dp))
                     Text(
                         s.supportFeedbackTitle,
-                        fontSize   = 14.sp,
+                        style      = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.SemiBold,
-                        color      = t.textPrimary
+                        color      = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(Modifier.height(10.dp))
 
-                    Surface(
-                        shape  = RoundedCornerShape(12.dp),
-                        color  = t.bgSurface,
-                        border = BorderStroke(0.5.dp, t.borderVariant),
-                        modifier = Modifier.fillMaxWidth()
+                    ElevatedCard(
+                        shape     = MaterialTheme.shapes.large,
+                        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 1.dp),
+                        colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                        modifier  = Modifier.fillMaxWidth()
                     ) {
                         Column {
                             // Send Feedback
@@ -302,14 +550,14 @@ fun ProfileScreen(
                                 verticalAlignment     = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                Icon(Icons.Rounded.Email, null, tint = t.accent, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.Email, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(s.sendFeedback, fontWeight = FontWeight.Medium, fontSize = 13.sp, color = t.textPrimary)
-                                    Text(s.sendFeedbackDesc, fontSize = 11.sp, color = t.textSecondary)
+                                    Text(s.sendFeedback, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    Text(s.sendFeedbackDesc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                Icon(Icons.Rounded.ChevronRight, null, tint = t.textSecondary.copy(0.4f), modifier = Modifier.size(16.dp))
+                                Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.4f), modifier = Modifier.size(16.dp))
                             }
-                            HorizontalDivider(color = t.borderVariant, modifier = Modifier.padding(horizontal = 14.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, modifier = Modifier.padding(horizontal = 14.dp))
 
                             // Support the Project
                             Row(
@@ -324,12 +572,12 @@ fun ProfileScreen(
                             ) {
                                 Icon(Icons.Rounded.Favorite, null, tint = RedDanger, modifier = Modifier.size(20.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(s.supportProject, fontWeight = FontWeight.Medium, fontSize = 13.sp, color = t.textPrimary)
-                                    Text(s.supportProjectDesc, fontSize = 11.sp, color = t.textSecondary)
+                                    Text(s.supportProject, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    Text(s.supportProjectDesc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                Icon(Icons.Rounded.ChevronRight, null, tint = t.textSecondary.copy(0.4f), modifier = Modifier.size(16.dp))
+                                Icon(Icons.Rounded.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.4f), modifier = Modifier.size(16.dp))
                             }
-                            HorizontalDivider(color = t.borderVariant, modifier = Modifier.padding(horizontal = 14.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, modifier = Modifier.padding(horizontal = 14.dp))
 
                             // Share Vyxel
                             Row(
@@ -348,10 +596,10 @@ fun ProfileScreen(
                                 verticalAlignment     = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                Icon(Icons.Rounded.Share, null, tint = t.accent, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.Share, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(s.shareVyxel, fontWeight = FontWeight.Medium, fontSize = 13.sp, color = t.textPrimary)
-                                    Text(s.shareVyxelDesc, fontSize = 11.sp, color = t.textSecondary)
+                                    Text(s.shareVyxel, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    Text(s.shareVyxelDesc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
                         }
@@ -363,9 +611,9 @@ fun ProfileScreen(
             if (favourites.isNotEmpty()) {
                 item {
                     Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                        HorizontalDivider(color = t.borderVariant)
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         Spacer(Modifier.height(12.dp))
-                        Text(s.favourites, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = t.textPrimary)
+                        Text(s.favourites, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                     }
                 }
                 items(favourites.take(5)) { repo ->
@@ -379,7 +627,7 @@ fun ProfileScreen(
             if (updates.isNotEmpty()) {
                 item {
                     Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                        HorizontalDivider(color = t.borderVariant)
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         Spacer(Modifier.height(12.dp))
                         Row(
                             modifier              = Modifier.fillMaxWidth(),
@@ -388,52 +636,33 @@ fun ProfileScreen(
                         ) {
                             Text(
                                 "${s.updatesAvailable} (${updates.size})",
-                                fontSize   = 14.sp,
+                                style      = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.SemiBold,
-                                color      = t.textPrimary
+                                color      = MaterialTheme.colorScheme.onSurface
                             )
                             TextButton(onClick = onCheckUpdates) {
-                                Text(s.refresh, color = t.accent, fontSize = 12.sp)
+                                Text(s.refresh, style = MaterialTheme.typography.labelMedium)
                             }
                         }
                     }
                 }
                 items(updates) { upd ->
                     Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                        Surface(
-                            shape  = RoundedCornerShape(12.dp),
-                            color  = t.bgSurface,
-                            border = BorderStroke(0.5.dp, t.borderVariant)
+                        Card(
+                            shape  = MaterialTheme.shapes.medium,
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
                         ) {
                             Row(
                                 modifier              = Modifier.fillMaxWidth().padding(12.dp),
                                 verticalAlignment     = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Icon(Icons.Rounded.Update, null, tint = t.accent, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.Update, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(upd.repoName, fontWeight = FontWeight.Medium, fontSize = 13.sp, color = t.textPrimary)
-                                    Text("${upd.currentTag} → ${upd.latestTag}", fontSize = 11.sp, color = t.textSecondary)
+                                    Text(upd.repoName, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    Text("${upd.currentTag} → ${upd.latestTag}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
-                        }
-                    }
-                }
-            }
-
-            // Check for Updates button
-            if (installHistory.isNotEmpty()) {
-                item {
-                    Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                        Button(
-                            onClick  = onCheckUpdates,
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
-                            shape    = RoundedCornerShape(12.dp),
-                            colors   = ButtonDefaults.buttonColors(containerColor = t.accent)
-                        ) {
-                            Icon(Icons.Rounded.Refresh, null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text(s.checkForUpdates, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -443,36 +672,33 @@ fun ProfileScreen(
             if (installHistory.isNotEmpty()) {
                 item {
                     Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                        HorizontalDivider(color = t.borderVariant)
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         Spacer(Modifier.height(12.dp))
-                        Text(s.installHistory, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = t.textPrimary)
+                        Text(s.installHistory, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                         Spacer(Modifier.height(4.dp))
-                        Text(s.installHistoryHint, fontSize = 11.sp, color = t.textSecondary)
+                        Text(s.installHistoryHint, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
                 items(installHistory.sortedByDescending { it.installedAt }.take(15)) { entry ->
                     Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { onRollback(entry) },
-                            shape  = RoundedCornerShape(12.dp),
-                            color  = t.bgSurface,
-                            border = BorderStroke(0.5.dp, t.borderVariant)
+                        Card(
+                            onClick  = { onRollback(entry) },
+                            shape    = MaterialTheme.shapes.extraLarge,
+                            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(0.35f)),
+                            border   = BorderStroke(0.5.dp, MaterialTheme.colorScheme.primary.copy(0.32f))
                         ) {
                             Row(
                                 modifier              = Modifier.padding(12.dp),
                                 verticalAlignment     = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Icon(Icons.Rounded.History, null, tint = t.accent, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.History, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(entry.repoName, fontWeight = FontWeight.Medium, fontSize = 13.sp, color = t.textPrimary)
-                                    Text(entry.tagName, fontSize = 11.sp, color = t.textSecondary)
-                                    Text(formatTimeAgo(entry.installedAt), fontSize = 10.sp, color = t.textSecondary.copy(0.7f))
+                                    Text(entry.repoName, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    Text(entry.tagName, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(formatTimeAgo(entry.installedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.7f))
                                 }
-                                Icon(Icons.Rounded.RestartAlt, null, tint = t.textSecondary, modifier = Modifier.size(16.dp))
+                                Icon(Icons.Rounded.RestartAlt, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                             }
                         }
                     }
@@ -483,19 +709,26 @@ fun ProfileScreen(
             if (history.isNotEmpty()) {
                 item {
                     Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                        HorizontalDivider(color = t.borderVariant)
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         Spacer(Modifier.height(12.dp))
-                        Text(s.recentlyViewed, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = t.textPrimary)
+                        Text(s.recentlyViewed, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                     }
                 }
                 items(history.take(5)) { item ->
                     Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                        AppListTile(repo = item.repo, onClick = { onAppClick(item.repo) })
+                        Card(
+                            shape  = MaterialTheme.shapes.extraLarge,
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(0.25f)),
+                            border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.primary.copy(0.25f))
+                        ) {
+                            AppListTile(repo = item.repo, onClick = { onAppClick(item.repo) })
+                        }
                     }
                 }
             }
         }
     }
+    } // Box
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -516,29 +749,47 @@ fun SettingsScreen(
     val context = LocalContext.current
     val s = LocalStrings.current
 
-    var themeMode           by remember { mutableStateOf(settings.themeMode)   }
-    var amoled              by remember { mutableStateOf(settings.amoledBlack) }
-    var fontName            by remember { mutableStateOf(settings.fontName)    }
-    var language            by remember { mutableStateOf(settings.language)    }
-    var fontExpanded        by remember { mutableStateOf(false)                }
-    var customEditorExpanded by remember { mutableStateOf(false) }
+    var themeMode            by remember { mutableStateOf(settings.themeMode)          }
+    var amoled               by remember { mutableStateOf(settings.amoledBlack)        }
+    var fontName             by remember { mutableStateOf(settings.fontName)           }
+    var language             by remember { mutableStateOf(settings.language)           }
+    var followSystemMonet    by remember { mutableStateOf(settings.followSystemMonet)  }
+    var fontExpanded         by remember { mutableStateOf(false)                       }
+    var customEditorExpanded by remember { mutableStateOf(false)                       }
 
-    val fonts = listOf("Samsung One UI", "Serif", "Monospace", "Cursive")
+    val fonts = listOf(
+        // Instant system fonts
+        "Default", "Serif", "Monospace", "Cursive",
+        "Roboto Condensed", "Roboto Medium", "Roboto Light", "Roboto Thin", "Roboto Black",
+        // Bundled fonts
+        "Kilo", "Chococooky",
+        // Top-rated Google Fonts (download on first use)
+        "Open Sans", "Merriweather", "Playfair Display", "Lora", "Oswald",
+        "Manrope", "Work Sans", "IBM Plex Sans", "Syne", "Libre Baskerville",
+        // More Google Fonts
+        "Poppins", "Nunito", "Montserrat", "DM Sans", "Lato", "Inter",
+        "Ubuntu", "Raleway", "Quicksand", "Josefin Sans", "Exo 2", "Outfit",
+        "Space Grotesk", "Plus Jakarta Sans", "Figtree", "Roboto Slab"
+    )
 
-    LaunchedEffect(themeMode, amoled, fontName, language) {
-        val mapped = when (fontName) { "Samsung One UI" -> "Default"; "Sans Serif" -> "SansSerif"; else -> fontName }
-        onSave(AppSettings(language, settings.githubToken, settings.sortBy, mapped, themeMode, amoled))
+    fun currentSettings(tok: String = settings.githubToken) =
+        AppSettings(language, tok, settings.sortBy, fontName, themeMode, amoled, followSystemMonet)
+
+    LaunchedEffect(themeMode, amoled, fontName, language, followSystemMonet) {
+        onSave(currentSettings())
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(t.bgPrimary)) {
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        ScreenBackground(ScreenBg.SETTINGS)
+    Column(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(t.bgSurface)
+                .background(Color.Transparent)
                 .statusBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
-            Text(s.settingsTitle, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = t.textPrimary)
+            Text(s.settingsTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
         }
 
         Column(
@@ -550,9 +801,9 @@ fun SettingsScreen(
             // ── Appearance label
             Text(
                 s.appearance,
-                fontSize      = 11.sp,
+                style         = MaterialTheme.typography.labelSmall,
                 fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
+                color         = MaterialTheme.colorScheme.primary,
                 letterSpacing = 1.sp
             )
 
@@ -570,31 +821,29 @@ fun SettingsScreen(
             var themeDropExpanded by remember { mutableStateOf(false) }
 
             Box {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .clickable { themeDropExpanded = true },
-                    shape  = RoundedCornerShape(16.dp),
-                    color  = t.bgSurface,
-                    border = BorderStroke(0.5.dp, t.borderVariant)
+                ElevatedCard(
+                    onClick   = { themeDropExpanded = true },
+                    shape     = MaterialTheme.shapes.large,
+                    elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                    colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                    modifier  = Modifier.fillMaxWidth()
                 ) {
                     Row(
                         modifier              = Modifier.fillMaxWidth().padding(16.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Text(selectedThemeLabel, fontSize = 14.sp, color = t.textPrimary, fontWeight = FontWeight.Medium)
+                        Text(selectedThemeLabel, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium)
                         Icon(
                             if (themeDropExpanded) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
-                            null, tint = t.textSecondary
+                            null, tint = MaterialTheme.colorScheme.primary.copy(0.70f)
                         )
                     }
                 }
                 DropdownMenu(
                     expanded         = themeDropExpanded,
                     onDismissRequest = { themeDropExpanded = false },
-                    containerColor   = t.bgSurface
+                    containerColor   = MaterialTheme.colorScheme.surface
                 ) {
                     themeOptions.forEach { (mode, label) ->
                         val selected = themeMode == mode
@@ -607,11 +856,11 @@ fun SettingsScreen(
                                 ) {
                                     Text(
                                         label,
-                                        color      = if (selected) t.accent else t.textPrimary,
-                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                        fontSize   = 14.sp
+                                        style      = MaterialTheme.typography.bodyMedium,
+                                        color      = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
                                     )
-                                    if (selected) Icon(Icons.Rounded.Check, null, tint = t.accent, modifier = Modifier.size(16.dp))
+                                    if (selected) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
                                 }
                             },
                             onClick = {
@@ -635,10 +884,11 @@ fun SettingsScreen(
                     )
                 } else {
                     // Compact "applied" row shown after editor collapses
-                    Surface(
-                        shape  = RoundedCornerShape(16.dp),
-                        color  = t.bgSurface,
-                        border = BorderStroke(1.dp, t.accent.copy(alpha = 0.45f))
+                    ElevatedCard(
+                        shape     = MaterialTheme.shapes.large,
+                        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                        colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                        modifier  = Modifier.fillMaxWidth()
                     ) {
                         Row(
                             modifier              = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -656,109 +906,99 @@ fun SettingsScreen(
                                         Box(
                                             Modifier.size(14.dp).clip(CircleShape)
                                                 .background(c)
-                                                .border(0.5.dp, t.borderVariant, CircleShape)
+                                                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
                                         )
                                     }
                                 }
                                 Column {
-                                    Text("Custom Theme", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = t.accent)
-                                    Text("Applied", fontSize = 11.sp, color = t.textSecondary)
+                                    Text("Custom Theme", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    Text("Applied", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(0.7f))
                                 }
                             }
                             TextButton(onClick = { customEditorExpanded = true }) {
-                                Icon(Icons.Rounded.Edit, null, tint = t.accent, modifier = Modifier.size(14.dp))
+                                Icon(Icons.Rounded.Edit, null, modifier = Modifier.size(14.dp))
                                 Spacer(Modifier.width(4.dp))
-                                Text("Edit", color = t.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                Text("Edit", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
                 }
             }
 
-            // Dynamic Colors (Monet / Material You)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                Surface(
-                    shape  = RoundedCornerShape(16.dp),
-                    color  = t.bgSurface,
-                    border = BorderStroke(0.5.dp, t.borderVariant)
-                ) {
+            // Accent Color — collapsed row + expandable picker
+            var accentPickerExpanded by remember { mutableStateOf(false) }
+            val defaultAccentColor = MaterialTheme.colorScheme.primary
+            var pendingAccent by remember(currentAccent) { mutableStateOf(currentAccent ?: defaultAccentColor) }
+            var accentChanged by remember { mutableStateOf(false) }
+
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
+            ) {
+                Column {
                     Row(
-                        modifier              = Modifier.fillMaxWidth().padding(16.dp),
+                        modifier              = Modifier
+                            .fillMaxWidth()
+                            .clickable { accentPickerExpanded = !accentPickerExpanded }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(s.materialYou, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = t.textPrimary)
-                            Text(
-                                s.materialYouDesc,
-                                fontSize = 12.sp, color = t.textSecondary, lineHeight = 17.sp
-                            )
-                        }
-                        Switch(
-                            checked         = useMonet,
-                            onCheckedChange = { onMonetToggle(it) },
-                            colors          = SwitchDefaults.colors(
-                                checkedThumbColor  = Color.White,
-                                checkedTrackColor  = t.accent
-                            )
+                        Text(
+                            "Accent Color",
+                            style      = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                            color      = MaterialTheme.colorScheme.onSurface
+                        )
+                        Box(
+                            Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(pendingAccent)
+                                .border(2.dp, MaterialTheme.colorScheme.primary.copy(0.40f), CircleShape)
                         )
                     }
-                }
-            }
-
-            // Theme Color
-            Text(
-                s.themeColor,
-                fontSize      = 11.sp,
-                fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
-                letterSpacing = 1.sp
-            )
-
-            val accentOptions: List<Color?> = listOf(
-                null,
-                Color(0xFF6C63FF), Color(0xFFFF6B35), Color(0xFF2196F3),
-                Color(0xFF1DB954), Color(0xFFE91E63), Color(0xFF00BCD4),
-                Color(0xFFFF9800), Color(0xFFF44336), Color(0xFF9C27B0)
-            )
-
-            Row(
-                modifier              = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                accentOptions.forEach { option ->
-                    val isSelected = !useMonet && currentAccent == option
-                    val bgMod      = if (option != null) Modifier.background(option, CircleShape)
-                    else Modifier.background(
-                        Brush.linearGradient(listOf(Color(0xFF6C63FF), Color(0xFFFF6B35))),
-                        CircleShape
-                    )
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .then(bgMod)
-                            .border(
-                                if (isSelected) 3.dp else 1.5.dp,
-                                if (isSelected) Color.White else t.borderVariant,
-                                CircleShape
+                    if (accentPickerExpanded) {
+                        Column(
+                            modifier            = Modifier
+                                .padding(horizontal = 16.dp)
+                                .padding(bottom = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            HsvColorWheel(
+                                color         = pendingAccent,
+                                onColorChange = {
+                                    pendingAccent = it
+                                    accentChanged = true
+                                },
+                                modifier = Modifier.fillMaxWidth()
                             )
-                            .clickable {
-                                if (option == null) onMonetToggle(true)
-                                else onAccentSelect(option)
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (isSelected) Icon(Icons.Rounded.Check, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Button(
+                                onClick  = {
+                                    onAccentSelect(pendingAccent)
+                                    accentPickerExpanded = false
+                                    accentChanged        = false
+                                },
+                                enabled  = accentChanged,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape    = MaterialTheme.shapes.large
+                            ) {
+                                Text("Save", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
                     }
                 }
             }
 
             // AMOLED
-            Surface(
-                shape  = RoundedCornerShape(16.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant)
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Row(
                     modifier              = Modifier.fillMaxWidth().padding(16.dp),
@@ -766,33 +1006,70 @@ fun SettingsScreen(
                     verticalAlignment     = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(s.amoledOverride, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = t.textPrimary)
-                        Text(s.amoledOverrideDesc, fontSize = 12.sp, color = t.textSecondary, lineHeight = 17.sp)
+                        Text(s.amoledOverride, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                        Text(s.amoledOverrideDesc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 17.sp)
                     }
                     Switch(
                         checked         = amoled,
-                        onCheckedChange = { amoled = it },
-                        colors          = SwitchDefaults.colors(
-                            checkedThumbColor = Color.White,
-                            checkedTrackColor = t.accent
-                        )
+                        onCheckedChange = { amoled = it }
                     )
+                }
+            }
+
+            // Monet / Material You
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
+            ) {
+                Column {
+                    Row(
+                        modifier              = Modifier.fillMaxWidth().padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment     = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Material You (Monet)", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                            Text("Use dynamic color from wallpaper (Android 12+)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 17.sp)
+                        }
+                        Switch(
+                            checked         = useMonet,
+                            onCheckedChange = { onMonetToggle(it) }
+                        )
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, modifier = Modifier.padding(horizontal = 16.dp))
+                    Row(
+                        modifier              = Modifier.fillMaxWidth().padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment     = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Follow System", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                            Text("Auto-enable Monet when system supports it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 17.sp)
+                        }
+                        Switch(
+                            checked         = followSystemMonet,
+                            onCheckedChange = { followSystemMonet = it }
+                        )
+                    }
                 }
             }
 
             // Font
             Text(
                 s.fontSection,
-                fontSize      = 11.sp,
+                style         = MaterialTheme.typography.labelSmall,
                 fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
+                color         = MaterialTheme.colorScheme.primary,
                 letterSpacing = 1.sp
             )
 
-            Surface(
-                shape  = RoundedCornerShape(16.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant)
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Column {
                     Row(
@@ -803,35 +1080,49 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Text(fontName, fontSize = 14.sp, color = t.textPrimary)
+                        Text(fontName, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
                         Icon(
                             if (fontExpanded) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
                             null,
-                            tint = t.textSecondary
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     AnimatedVisibility(visible = fontExpanded) {
                         Column {
                             fonts.forEach { f ->
+                                var ff by remember(f) { mutableStateOf(fontFamilyFor(f)) }
+                                LaunchedEffect(f) {
+                                    if (f in googleFontNames) ff = loadGoogleFont(context, f)
+                                }
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .background(if (fontName == f) t.accentContainer.copy(0.3f) else Color.Transparent)
-                                        .clickable { fontName = f; fontExpanded = false }
-                                        .padding(horizontal = 20.dp, vertical = 13.dp),
+                                        .background(if (fontName == f) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                                        .clickable { fontName = f; fontExpanded = false; onSave(currentSettings()) }
+                                        .padding(horizontal = 20.dp, vertical = 10.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment     = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        f,
-                                        fontSize   = 14.sp,
-                                        color      = t.textPrimary,
-                                        fontWeight = if (fontName == f) FontWeight.SemiBold else FontWeight.Normal,
-                                        fontFamily = fontFamilyFor(if (f == "Samsung One UI") "Default" else f)
-                                    )
-                                    if (fontName == f) Icon(Icons.Rounded.Check, null, tint = t.accent, modifier = Modifier.size(16.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            f,
+                                            style      = MaterialTheme.typography.bodyMedium,
+                                            color      = if (fontName == f) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                            fontWeight = if (fontName == f) FontWeight.SemiBold else FontWeight.Normal,
+                                            fontFamily = ff
+                                        )
+                                        Text(
+                                            "The quick brown fox",
+                                            style      = MaterialTheme.typography.labelSmall,
+                                            color      = if (fontName == f) MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.65f)
+                                                         else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                                            fontFamily = ff,
+                                            maxLines   = 1
+                                        )
+                                    }
+                                    if (fontName == f) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
                                 }
-                                if (f != fonts.last()) HorizontalDivider(color = t.borderVariant, modifier = Modifier.padding(horizontal = 16.dp))
+                                if (f != fonts.last()) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.5f), modifier = Modifier.padding(horizontal = 16.dp))
                             }
                         }
                     }
@@ -841,9 +1132,9 @@ fun SettingsScreen(
             // Language
             Text(
                 s.languageSection,
-                fontSize      = 11.sp,
+                style         = MaterialTheme.typography.labelSmall,
                 fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
+                color         = MaterialTheme.colorScheme.primary,
                 letterSpacing = 1.sp
             )
 
@@ -854,10 +1145,11 @@ fun SettingsScreen(
             )
             var langExpanded by remember { mutableStateOf(false) }
 
-            Surface(
-                shape  = RoundedCornerShape(16.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant)
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Column {
                     Row(
@@ -868,11 +1160,11 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Text(language, fontSize = 14.sp, color = t.textPrimary)
+                        Text(language, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
                         Icon(
                             if (langExpanded) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
                             null,
-                            tint = t.textSecondary
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     AnimatedVisibility(visible = langExpanded) {
@@ -881,12 +1173,11 @@ fun SettingsScreen(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .background(if (language == lang) t.accentContainer.copy(0.3f) else Color.Transparent)
+                                        .background(if (language == lang) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
                                         .clickable {
                                             language = lang
                                             langExpanded = false
-                                            val mapped = when (fontName) { "Samsung One UI" -> "Default"; "Sans Serif" -> "SansSerif"; else -> fontName }
-                                            onSave(AppSettings(lang, settings.githubToken, settings.sortBy, mapped, themeMode, amoled))
+                                            onSave(currentSettings())
                                         }
                                         .padding(horizontal = 20.dp, vertical = 13.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -894,13 +1185,13 @@ fun SettingsScreen(
                                 ) {
                                     Text(
                                         lang,
-                                        fontSize   = 14.sp,
-                                        color      = t.textPrimary,
+                                        style      = MaterialTheme.typography.bodyMedium,
+                                        color      = if (language == lang) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
                                         fontWeight = if (language == lang) FontWeight.SemiBold else FontWeight.Normal
                                     )
-                                    if (language == lang) Icon(Icons.Rounded.Check, null, tint = t.accent, modifier = Modifier.size(16.dp))
+                                    if (language == lang) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
                                 }
-                                if (lang != supportedLanguages.last()) HorizontalDivider(color = t.borderVariant, modifier = Modifier.padding(horizontal = 16.dp))
+                                if (lang != supportedLanguages.last()) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.5f), modifier = Modifier.padding(horizontal = 16.dp))
                             }
                         }
                     }
@@ -910,19 +1201,20 @@ fun SettingsScreen(
             // GitHub Token
             Text(
                 s.githubSection,
-                fontSize      = 11.sp,
+                style         = MaterialTheme.typography.labelSmall,
                 fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
+                color         = MaterialTheme.colorScheme.primary,
                 letterSpacing = 1.sp
             )
 
             var githubTokenInput by remember { mutableStateOf(settings.githubToken) }
             var isEditingToken   by remember { mutableStateOf(settings.githubToken.isEmpty()) }
 
-            Surface(
-                shape  = RoundedCornerShape(16.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant)
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Column(
                     modifier            = Modifier.padding(16.dp),
@@ -932,18 +1224,22 @@ fun SettingsScreen(
                         verticalAlignment     = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Rounded.Lock, null, tint = t.accent, modifier = Modifier.size(18.dp))
+                        Image(
+                            painter            = painterResource(R.drawable.github),
+                            contentDescription = null,
+                            modifier           = Modifier.size(48.dp)
+                        )
                         Column {
                             Text(
                                 s.personalAccessToken,
-                                fontSize   = 14.sp,
+                                style      = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium,
-                                color      = t.textPrimary
+                                color      = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 s.tokenRequired,
-                                fontSize = 11.sp,
-                                color    = t.textSecondary
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -952,18 +1248,18 @@ fun SettingsScreen(
                         TextField(
                             value         = githubTokenInput,
                             onValueChange = { githubTokenInput = it },
-                            modifier      = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
-                            placeholder   = { Text("ghp_xxxxxxxxxxxx", color = t.textSecondary, fontSize = 13.sp) },
+                            modifier      = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small),
+                            placeholder   = { Text("ghp_xxxxxxxxxxxx", style = MaterialTheme.typography.bodyMedium) },
                             singleLine    = true,
                             visualTransformation = if (githubTokenInput.length > 4)
                                 PasswordVisualTransformation() else VisualTransformation.None,
                             colors = TextFieldDefaults.colors(
-                                focusedContainerColor   = t.bgSurfaceAlt,
-                                unfocusedContainerColor = t.bgSurfaceAlt,
-                                focusedIndicatorColor   = t.accent,
+                                focusedContainerColor   = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                focusedIndicatorColor   = MaterialTheme.colorScheme.primary,
                                 unfocusedIndicatorColor = Color.Transparent,
-                                focusedTextColor        = t.textPrimary,
-                                unfocusedTextColor      = t.textPrimary
+                                focusedTextColor        = MaterialTheme.colorScheme.onSurface,
+                                unfocusedTextColor      = MaterialTheme.colorScheme.onSurface
                             )
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -974,25 +1270,23 @@ fun SettingsScreen(
                                         "Sans Serif"     -> "SansSerif"
                                         else             -> fontName
                                     }
-                                    onSave(AppSettings(language, githubTokenInput.trim(), settings.sortBy, mapped, themeMode, amoled))
+                                    onSave(currentSettings(githubTokenInput.trim()))
                                     isEditingToken = false
                                 },
-                                modifier = Modifier.weight(1f).height(42.dp),
-                                shape    = RoundedCornerShape(10.dp),
-                                colors   = ButtonDefaults.buttonColors(containerColor = t.accent)
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                shape    = MaterialTheme.shapes.medium
                             ) {
                                 Icon(Icons.Rounded.Check, null, modifier = Modifier.size(14.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text(s.saveToken, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text(s.saveToken, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                             }
                             if (settings.githubToken.isNotEmpty()) {
                                 OutlinedButton(
                                     onClick  = { githubTokenInput = settings.githubToken; isEditingToken = false },
-                                    shape    = RoundedCornerShape(10.dp),
-                                    border   = BorderStroke(1.dp, t.borderVariant),
-                                    modifier = Modifier.height(42.dp)
+                                    shape    = MaterialTheme.shapes.medium,
+                                    modifier = Modifier.height(44.dp)
                                 ) {
-                                    Text("Cancel", color = t.textSecondary, fontSize = 13.sp)
+                                    Text("Cancel", style = MaterialTheme.typography.labelLarge)
                                 }
                             }
                         }
@@ -1001,20 +1295,20 @@ fun SettingsScreen(
                         Row(
                             modifier              = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(t.bgSurfaceAlt)
+                                .clip(MaterialTheme.shapes.small)
+                                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
                                 .padding(start = 16.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment     = Alignment.CenterVertically
                         ) {
                             Text(
                                 "••••••••••••••••••••",
-                                color    = t.textSecondary,
-                                fontSize = 14.sp,
+                                style    = MaterialTheme.typography.bodyMedium,
+                                color    = MaterialTheme.colorScheme.primary.copy(0.60f),
                                 modifier = Modifier.padding(vertical = 14.dp)
                             )
                             IconButton(onClick = { isEditingToken = true }) {
-                                Icon(Icons.Rounded.Edit, null, tint = t.textSecondary, modifier = Modifier.size(18.dp))
+                                Icon(Icons.Rounded.Edit, null, tint = MaterialTheme.colorScheme.primary.copy(0.70f), modifier = Modifier.size(18.dp))
                             }
                         }
                     }
@@ -1024,244 +1318,209 @@ fun SettingsScreen(
             // About
             Text(
                 s.aboutSection,
-                fontSize      = 11.sp,
+                style         = MaterialTheme.typography.labelSmall,
                 fontWeight    = FontWeight.Bold,
-                color         = t.textSecondary,
+                color         = MaterialTheme.colorScheme.primary,
                 letterSpacing = 1.sp
             )
 
-            Surface(
-                shape  = RoundedCornerShape(16.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant)
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Row(
                     modifier              = Modifier.fillMaxWidth().padding(16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(s.versionLabel, fontSize = 14.sp, color = t.textPrimary)
-                    Text("1.0.1",   fontSize = 14.sp, color = t.textSecondary)
+                    Text(s.versionLabel, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Text("1.0.2", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary.copy(0.80f))
                 }
             }
         }
     }
+    } // Box
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CUSTOM THEME EDITOR
 // ─────────────────────────────────────────────────────────────────────────────
-
-private val THEME_PRESETS = listOf(
-    "Dark"    to { DarkTheme.toCustomThemeData() },
-    "Light"   to { LightTheme.toCustomThemeData() },
-    "AMOLED"  to { AmoledTheme.toCustomThemeData() },
-    "Sunset"  to { SunsetTheme.toCustomThemeData() },
-    "Minimal" to { MinimalTheme.toCustomThemeData() }
+private class ColorSlot(
+    val key        : String,
+    val label      : String,
+    val desc       : String,
+    val getHex     : (CustomThemeData) -> String,
+    val getFallback: (AppThemeColors)  -> Color,
+    val setHex     : (CustomThemeData, String) -> CustomThemeData,
+    val required   : Boolean = false
 )
 
+private val themeColorSlots = listOf(
+    ColorSlot("accent",    "Accent / Primary", "Main brand & button color",
+        { it.accentHex },    { it.accent },         { d, h -> d.copy(accentHex    = h) }, required = true),
+    ColorSlot("bg",        "Background",        "App background color",
+        { it.bgHex },        { it.bgPrimary },      { d, h -> d.copy(bgHex        = h) }),
+    ColorSlot("surface",   "Surface",           "Cards and container color",
+        { it.surfaceHex },   { it.bgSurface },      { d, h -> d.copy(surfaceHex   = h) }),
+    ColorSlot("text",      "Text",              "Primary text color",
+        { it.onSurfaceHex }, { it.textPrimary },    { d, h -> d.copy(onSurfaceHex = h) }),
+    ColorSlot("secondary", "Secondary",         "Secondary accent color",
+        { it.secondaryHex }, { it.accentAlt },      { d, h -> d.copy(secondaryHex = h) }),
+    ColorSlot("tertiary",  "Tertiary",          "Tertiary accent color",
+        { it.tertiaryHex },  { it.accentTertiary }, { d, h -> d.copy(tertiaryHex  = h) })
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HSV COLOR WHEEL  — full circular picker (hue=angle, saturation=radius)
+// ─────────────────────────────────────────────────────────────────────────────
+
+private const val WHEEL_BMP_SIZE = 256
+
 @Composable
-private fun ColorField(
-    label    : String,
-    hexValue : String,
-    onChange : (String) -> Unit
+private fun HsvColorWheel(
+    color        : Color,
+    onColorChange: (Color) -> Unit,
+    modifier     : Modifier = Modifier
 ) {
-    val t            = LocalTheme.current
-    val color        = hexToColor(hexValue, fallback = t.accent)
-    var showSliders  by remember { mutableStateOf(false) }
-
-    // Extract R/G/B from hex string
-    val hexClean = hexValue.trimStart('#').padStart(6, '0').take(6)
-    val rInt = hexClean.substring(0, 2).toIntOrNull(16) ?: 0
-    val gInt = hexClean.substring(2, 4).toIntOrNull(16) ?: 0
-    val bInt = hexClean.substring(4, 6).toIntOrNull(16) ?: 0
-
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-        Row(
-            modifier              = Modifier.fillMaxWidth(),
-            verticalAlignment     = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(
-                label,
-                fontSize  = 12.sp,
-                color     = t.textSecondary,
-                modifier  = Modifier.width(112.dp),
-                maxLines  = 1
+    val initHsv = remember(color) {
+        FloatArray(3).also { arr ->
+            android.graphics.Color.colorToHSV(
+                android.graphics.Color.rgb(
+                    (color.red   * 255).toInt(),
+                    (color.green * 255).toInt(),
+                    (color.blue  * 255).toInt()
+                ), arr
             )
-            TextField(
-                value         = hexValue,
-                onValueChange = { v ->
-                    val clean = v.trimStart().let { if (it.startsWith("#")) it else "#$it" }
-                    if (clean.length <= 7) onChange(clean)
-                },
-                modifier    = Modifier.weight(1f).clip(RoundedCornerShape(8.dp)),
-                singleLine  = true,
-                placeholder = { Text("#RRGGBB", color = t.textSecondary, fontSize = 12.sp) },
-                colors      = TextFieldDefaults.colors(
-                    focusedContainerColor   = t.bgSurfaceAlt,
-                    unfocusedContainerColor = t.bgSurfaceAlt,
-                    focusedTextColor        = t.textPrimary,
-                    unfocusedTextColor      = t.textPrimary,
-                    focusedIndicatorColor   = t.accent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                    cursorColor             = t.accent
-                )
-            )
-            // Tapping the swatch toggles RGB sliders
-            Box(
-                modifier = Modifier
-                    .size(30.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(color)
-                    .border(
-                        width  = if (showSliders) 2.dp else 1.dp,
-                        color  = if (showSliders) t.accent else t.borderVariant,
-                        shape  = RoundedCornerShape(6.dp)
-                    )
-                    .clickable { showSliders = !showSliders }
-            )
-        }
-
-        // RGB slider panel — toggled by clicking the color swatch
-        AnimatedVisibility(visible = showSliders) {
-            Column(
-                modifier            = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 122.dp, top = 6.dp, bottom = 2.dp),
-                verticalArrangement = Arrangement.spacedBy(0.dp)
-            ) {
-                data class Channel(val name: String, val value: Int, val trackColor: Color)
-                listOf(
-                    Channel("R", rInt, Color(1f, 0.2f, 0.2f)),
-                    Channel("G", gInt, Color(0.2f, 0.8f, 0.3f)),
-                    Channel("B", bInt, Color(0.3f, 0.5f, 1f))
-                ).forEach { ch ->
-                    Row(
-                        verticalAlignment     = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Text(
-                            ch.name,
-                            fontSize   = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            color      = ch.trackColor,
-                            modifier   = Modifier.width(10.dp)
-                        )
-                        Slider(
-                            value          = ch.value.toFloat(),
-                            onValueChange  = { v ->
-                                val nv = v.toInt()
-                                onChange("#%02X%02X%02X".format(
-                                    if (ch.name == "R") nv else rInt,
-                                    if (ch.name == "G") nv else gInt,
-                                    if (ch.name == "B") nv else bInt
-                                ))
-                            },
-                            valueRange     = 0f..255f,
-                            steps          = 0,
-                            modifier       = Modifier.weight(1f).height(28.dp),
-                            colors         = SliderDefaults.colors(
-                                thumbColor         = ch.trackColor,
-                                activeTrackColor   = ch.trackColor,
-                                inactiveTrackColor = t.bgSurfaceHigh
-                            )
-                        )
-                        Text(
-                            "%3d".format(ch.value),
-                            fontSize  = 10.sp,
-                            color     = t.textSecondary,
-                            modifier  = Modifier.width(22.dp)
-                        )
-                    }
-                }
-            }
         }
     }
-}
+    var hue        by remember(color) { mutableFloatStateOf(initHsv[0]) }
+    var saturation by remember(color) { mutableFloatStateOf(initHsv[1]) }
+    var brightness by remember(color) { mutableFloatStateOf(initHsv[2]) }
 
-@Composable
-private fun LiveThemePreview(p: AppThemeColors) {
-    Surface(
-        shape  = RoundedCornerShape(14.dp),
-        color  = p.bgPrimary,
-        border = BorderStroke(0.5.dp, p.borderVariant)
+    fun emit() = onColorChange(
+        Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, brightness)))
+    )
+
+    // Pre-built wheel bitmap: hue = angle, saturation = radius, brightness = 1
+    val wheelBmp = remember {
+        val bmp  = android.graphics.Bitmap.createBitmap(WHEEL_BMP_SIZE, WHEEL_BMP_SIZE, android.graphics.Bitmap.Config.ARGB_8888)
+        val hsv  = FloatArray(3).also { it[2] = 1f }
+        val cx   = WHEEL_BMP_SIZE / 2f; val cy = WHEEL_BMP_SIZE / 2f; val r = WHEEL_BMP_SIZE / 2f
+        for (y in 0 until WHEEL_BMP_SIZE) {
+            for (x in 0 until WHEEL_BMP_SIZE) {
+                val dx   = x - cx; val dy = y - cy
+                val dist = sqrt(dx * dx + dy * dy)
+                if (dist > r) { bmp.setPixel(x, y, android.graphics.Color.TRANSPARENT); continue }
+                hsv[0] = (atan2(dy.toDouble(), dx.toDouble()).toFloat() * 180f / PI.toFloat() + 360f) % 360f
+                hsv[1] = dist / r
+                bmp.setPixel(x, y, android.graphics.Color.HSVToColor(hsv))
+            }
+        }
+        bmp
+    }
+    val wheelImage = remember(wheelBmp) { wheelBmp.asImageBitmap() }
+
+    val t = LocalTheme.current
+
+    Column(
+        modifier            = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            // ── Top bar ───────────────────────────────────────────────────
-            Row(
+        // ── Wheel ─────────────────────────────────────────────────────────────
+        Canvas(
+            modifier = Modifier
+                .size(260.dp)
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { offset ->
+                            val cx = size.width / 2f; val cy = size.height / 2f
+                            val dx = offset.x - cx;   val dy = offset.y - cy
+                            val maxR = minOf(size.width, size.height) / 2f
+                            hue = (atan2(dy.toDouble(), dx.toDouble()).toFloat() * 180f / PI.toFloat() + 360f) % 360f
+                            saturation = (sqrt(dx * dx + dy * dy) / maxR).coerceIn(0f, 1f)
+                            emit()
+                        },
+                        onDrag = { change, _ ->
+                            val cx = size.width / 2f; val cy = size.height / 2f
+                            val dx = change.position.x - cx; val dy = change.position.y - cy
+                            val maxR = minOf(size.width, size.height) / 2f
+                            hue = (atan2(dy.toDouble(), dx.toDouble()).toFloat() * 180f / PI.toFloat() + 360f) % 360f
+                            saturation = (sqrt(dx * dx + dy * dy) / maxR).coerceIn(0f, 1f)
+                            emit()
+                        }
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        val cx = size.width / 2f; val cy = size.height / 2f
+                        val dx = offset.x - cx;   val dy = offset.y - cy
+                        val maxR = minOf(size.width, size.height) / 2f
+                        if (sqrt(dx * dx + dy * dy) <= maxR) {
+                            hue = (atan2(dy.toDouble(), dx.toDouble()).toFloat() * 180f / PI.toFloat() + 360f) % 360f
+                            saturation = (sqrt(dx * dx + dy * dy) / maxR).coerceIn(0f, 1f)
+                            emit()
+                        }
+                    }
+                }
+        ) {
+            val wSize = IntSize(size.width.toInt(), size.height.toInt())
+            // Draw the hue+saturation wheel
+            drawImage(image = wheelImage, dstSize = wSize)
+            // Darken overlay to simulate brightness < 1
+            if (brightness < 1f) drawCircle(
+                color  = Color.Black.copy(alpha = 1f - brightness),
+                radius = size.minDimension / 2f
+            )
+            // White rim
+            drawCircle(
+                color  = Color.White.copy(alpha = 0.12f),
+                radius = size.minDimension / 2f,
+                style  = Stroke(width = 2.dp.toPx())
+            )
+            // Selector dot
+            val maxR   = size.minDimension / 2f
+            val ang    = hue * PI.toFloat() / 180f
+            val sx     = size.width  / 2f + saturation * maxR * cos(ang)
+            val sy     = size.height / 2f + saturation * maxR * sin(ang)
+            val selPos = Offset(sx, sy)
+            val selClr = Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, brightness)))
+            drawCircle(color = Color.White,              radius = 14.dp.toPx(), center = selPos)
+            drawCircle(color = selClr,                   radius = 11.dp.toPx(), center = selPos)
+            drawCircle(color = Color.White.copy(0.6f),   radius = 14.dp.toPx(), center = selPos, style = Stroke(2.dp.toPx()))
+        }
+
+        // ── Brightness slider ─────────────────────────────────────────────────
+        Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Brightness", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val fullClr = Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, 1f)))
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(p.bgSurface)
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment     = Alignment.CenterVertically
+                    .height(40.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(p.accent))
-                    Text("Vyxel Apps", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = p.textPrimary)
-                }
-                Box(Modifier.size(20.dp).clip(RoundedCornerShape(6.dp)).background(p.accentContainer))
-            }
-
-            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                // ── App tile card ─────────────────────────────────────────
-                Surface(
-                    shape  = RoundedCornerShape(10.dp),
-                    color  = p.bgSurface,
-                    border = BorderStroke(0.5.dp, p.borderVariant)
-                ) {
-                    Row(
-                        modifier              = Modifier.fillMaxWidth().padding(10.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment     = Alignment.CenterVertically
-                    ) {
-                        Box(Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(p.bgSurfaceHigh))
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                            Box(Modifier.fillMaxWidth(0.55f).height(9.dp).clip(RoundedCornerShape(3.dp)).background(p.textPrimary))
-                            Box(Modifier.fillMaxWidth(0.85f).height(7.dp).clip(RoundedCornerShape(3.dp)).background(p.textSecondary.copy(0.45f)))
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Box(Modifier.width(28.dp).height(14.dp).clip(RoundedCornerShape(7.dp)).background(p.accent.copy(0.2f)).border(0.5.dp, p.accent.copy(0.5f), RoundedCornerShape(7.dp)))
-                                Box(Modifier.width(36.dp).height(14.dp).clip(RoundedCornerShape(7.dp)).background(p.accentContainer.copy(0.3f)).border(0.5.dp, p.accentContainer.copy(0.6f), RoundedCornerShape(7.dp)))
-                            }
-                        }
-                        Box(Modifier.size(22.dp).clip(CircleShape).background(p.accent.copy(0.15f)).border(1.dp, p.accent.copy(0.4f), CircleShape))
-                    }
-                }
-                // ── Action button ─────────────────────────────────────────
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Box(
-                        Modifier.weight(1f).height(28.dp).clip(RoundedCornerShape(8.dp))
-                            .background(p.bgSurfaceAlt)
-                            .border(1.dp, p.borderVariant, RoundedCornerShape(8.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Box(Modifier.width(40.dp).height(7.dp).clip(RoundedCornerShape(3.dp)).background(p.textSecondary.copy(0.5f)))
-                    }
-                    Box(
-                        Modifier.weight(1f).height(28.dp).clip(RoundedCornerShape(8.dp)).background(p.accent),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Box(Modifier.width(40.dp).height(7.dp).clip(RoundedCornerShape(3.dp)).background(p.onAccentContainer.copy(0.8f)))
-                    }
-                }
-                // ── Nav dock strip ────────────────────────────────────────
-                Surface(
-                    shape  = RoundedCornerShape(20.dp),
-                    color  = p.dockBg,
-                    border = BorderStroke(0.5.dp, p.borderVariant.copy(0.5f)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier              = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment     = Alignment.CenterVertically
-                    ) {
-                        Box(Modifier.size(14.dp).clip(RoundedCornerShape(4.dp)).background(p.accent.copy(0.2f)))
-                        listOf(0.35f, 0.35f, 0.35f, 0.35f).forEach { alpha ->
-                            Box(Modifier.size(14.dp).clip(RoundedCornerShape(4.dp)).background(p.dockForeground.copy(alpha)))
-                        }
-                    }
-                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(18.dp)
+                        .align(Alignment.Center)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(Brush.horizontalGradient(listOf(Color.Black, fullClr)))
+                )
+                Slider(
+                    value         = brightness,
+                    onValueChange = { brightness = it; emit() },
+                    valueRange    = 0f..1f,
+                    modifier      = Modifier.fillMaxWidth(),
+                    colors        = SliderDefaults.colors(
+                        thumbColor           = Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, brightness))),
+                        activeTrackColor     = Color.Transparent,
+                        inactiveTrackColor   = Color.Transparent,
+                        activeTickColor      = Color.Transparent,
+                        inactiveTickColor    = Color.Transparent
+                    )
+                )
             }
         }
     }
@@ -1273,146 +1532,193 @@ fun CustomThemeEditor(
     onSave    : (CustomThemeData) -> Unit,
     onApplied : () -> Unit = {}
 ) {
-    val t = LocalTheme.current
-    var d       by remember(initial) { mutableStateOf(initial) }
-    var applied by remember { mutableStateOf(false) }
+    var d            by remember(initial) { mutableStateOf(initial) }
+    var applied      by remember { mutableStateOf(false) }
+    var expandedSlot by remember { mutableStateOf<String?>("accent") }
 
     LaunchedEffect(applied) {
         if (applied) { kotlinx.coroutines.delay(650); onApplied() }
     }
 
-    Surface(
-        shape  = RoundedCornerShape(16.dp),
-        color  = t.bgSurface,
-        border = BorderStroke(0.5.dp, t.borderVariant)
+    val previewTheme = remember(d) { d.toAppThemeColors() }
+
+    val slots = themeColorSlots
+
+    ElevatedCard(
+        shape     = MaterialTheme.shapes.extraLarge,
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 4.dp),
+        colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
     ) {
         Column(
-            modifier            = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            modifier            = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                "Custom Theme Editor",
-                fontSize   = 14.sp,
+                "Custom Theme",
+                style      = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
-                color      = t.textPrimary
+                color      = MaterialTheme.colorScheme.onSurface
             )
 
-            // ── Load preset ───────────────────────────────────────────────
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("LOAD PRESET", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                    color = t.textSecondary, letterSpacing = 1.sp)
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.horizontalScroll(rememberScrollState())
-                ) {
-                    THEME_PRESETS.forEach { (name, factory) ->
-                        OutlinedButton(
-                            onClick      = { d = factory() },
-                            shape        = RoundedCornerShape(20.dp),
-                            border       = BorderStroke(1.dp, t.borderVariant),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                        ) {
-                            Text(name, fontSize = 12.sp, color = t.textPrimary)
+            // ── Live preview ──────────────────────────────────────────────
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(100.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(previewTheme.bgPrimary)
+                    .border(0.5.dp, previewTheme.borderVariant, RoundedCornerShape(16.dp))
+            ) {
+                Column(modifier = Modifier.fillMaxSize().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(previewTheme.bgSurface)
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Row(modifier = Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("App name", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = previewTheme.textPrimary, maxLines = 1)
+                                Text("by developer", style = MaterialTheme.typography.labelSmall, color = previewTheme.textSecondary, maxLines = 1)
+                            }
+                            Box(
+                                modifier         = Modifier.height(22.dp).clip(RoundedCornerShape(11.dp)).background(previewTheme.accent).padding(horizontal = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("Install", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                        }
+                    }
+                    // Mini nav dock
+                    Row(
+                        modifier              = Modifier
+                            .fillMaxWidth()
+                            .height(18.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(previewTheme.dockBg)
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment     = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        repeat(4) { i ->
+                            Box(modifier = Modifier.size(if (i == 0) 6.dp else 5.dp).clip(CircleShape)
+                                .background(if (i == 0) previewTheme.dockForeground else previewTheme.dockForeground.copy(alpha = 0.35f)))
                         }
                     }
                 }
             }
 
-            HorizontalDivider(color = t.borderVariant)
-
-            // ── Backgrounds ───────────────────────────────────────────────
-            Text("BACKGROUNDS", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                color = t.textSecondary, letterSpacing = 1.sp)
-            ColorField("Background",   d.bgPrimary)    { d = d.copy(bgPrimary    = it) }
-            ColorField("Surface",      d.bgSurface)    { d = d.copy(bgSurface    = it) }
-            ColorField("Surface Alt",  d.bgSurfaceAlt) { d = d.copy(bgSurfaceAlt = it) }
-            ColorField("Surface High", d.bgSurfaceHigh){ d = d.copy(bgSurfaceHigh= it) }
-
-            HorizontalDivider(color = t.borderVariant)
-
-            // ── Text ──────────────────────────────────────────────────────
-            Text("TEXT", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                color = t.textSecondary, letterSpacing = 1.sp)
-            ColorField("Primary text",   d.textPrimary)   { d = d.copy(textPrimary   = it) }
-            ColorField("Secondary text", d.textSecondary) { d = d.copy(textSecondary = it) }
-
-            HorizontalDivider(color = t.borderVariant)
-
-            // ── Accent / Primary ──────────────────────────────────────────
-            Text("ACCENT / PRIMARY", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                color = t.textSecondary, letterSpacing = 1.sp)
-            ColorField("Accent",       d.accent)           { d = d.copy(accent           = it) }
-            ColorField("Accent alt",   d.accentAlt)        { d = d.copy(accentAlt        = it) }
-            ColorField("Container",    d.accentContainer)  { d = d.copy(accentContainer  = it) }
-            ColorField("On container", d.onAccentContainer){ d = d.copy(onAccentContainer= it) }
-
-            HorizontalDivider(color = t.borderVariant)
-
-            // ── Borders ───────────────────────────────────────────────────
-            Text("BORDERS", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                color = t.textSecondary, letterSpacing = 1.sp)
-            ColorField("Border",     d.border)       { d = d.copy(border        = it) }
-            ColorField("Border dim", d.borderVariant){ d = d.copy(borderVariant = it) }
-
-            HorizontalDivider(color = t.borderVariant)
-
-            // ── Appearance mode (dark / light status bar) ─────────────────
+            // ── Dark / Light toggle ───────────────────────────────────────
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment     = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Appearance", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = t.textPrimary)
-                    Text("Controls status-bar icon colour", fontSize = 11.sp, color = t.textSecondary)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Appearance", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(true to "Dark", false to "Light").forEach { (dark, label) ->
                         val selected = d.isDark == dark
-                        Surface(
-                            shape  = RoundedCornerShape(20.dp),
-                            color  = if (selected) t.accent.copy(0.18f) else Color.Transparent,
-                            border = BorderStroke(1.dp, if (selected) t.accent else t.borderVariant),
-                            modifier = Modifier.clickable { d = d.copy(isDark = dark) }
-                        ) {
-                            Text(
-                                label,
-                                fontSize  = 12.sp,
-                                color     = if (selected) t.accent else t.textSecondary,
-                                fontWeight= if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                modifier  = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                            )
-                        }
+                        FilterChip(
+                            selected = selected,
+                            onClick  = { d = d.copy(isDark = dark) },
+                            label    = { Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal) }
+                        )
                     }
                 }
             }
 
-            // ── Live preview ──────────────────────────────────────────────
-            val preview = d.toAppThemeColors()
-            LiveThemePreview(preview)
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-            // ── Apply ─────────────────────────────────────────────────────
+            // ── Color slots ───────────────────────────────────────────────
+            slots.forEach { slot ->
+                val storedHex = slot.getHex(d)
+                val effectiveColor = if (storedHex.isNotEmpty()) hexToColor(storedHex, slot.getFallback(previewTheme))
+                                     else slot.getFallback(previewTheme)
+                val isExpanded    = expandedSlot == slot.key
+                val isCustomized  = storedHex.isNotEmpty() && !slot.required
+
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(MaterialTheme.shapes.medium)
+                            .clickable { expandedSlot = if (isExpanded) null else slot.key }
+                            .padding(horizontal = 4.dp, vertical = 8.dp),
+                        verticalAlignment     = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(effectiveColor)
+                                .border(1.5.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(slot.label, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                if (isCustomized) {
+                                    Box(modifier = Modifier.size(5.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary))
+                                }
+                            }
+                            Text(slot.desc, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (isCustomized) {
+                            TextButton(
+                                onClick        = { d = slot.setHex(d, "") },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("Reset", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        Icon(
+                            if (isExpanded) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
+                            null,
+                            tint     = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.6f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = isExpanded,
+                        enter   = expandVertically() + fadeIn(),
+                        exit    = shrinkVertically() + fadeOut()
+                    ) {
+                        Box(modifier = Modifier.padding(bottom = 8.dp)) {
+                            HsvColorWheel(
+                                color         = effectiveColor,
+                                onColorChange = { d = slot.setHex(d, it.toHex6()) },
+                                modifier      = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    if (slot.key != slots.last().key) {
+                        HorizontalDivider(
+                            color    = MaterialTheme.colorScheme.outlineVariant.copy(0.4f),
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                    }
+                }
+            }
+
+            // ── Apply button ──────────────────────────────────────────────
             Button(
                 onClick  = { if (!applied) { onSave(d); applied = true } },
                 enabled  = !applied,
-                modifier = Modifier.fillMaxWidth().height(46.dp),
-                shape    = RoundedCornerShape(12.dp),
-                colors   = ButtonDefaults.buttonColors(
-                    containerColor         = t.accent,
-                    disabledContainerColor = t.bgSurfaceAlt,
-                    disabledContentColor   = t.textSecondary
-                )
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape    = MaterialTheme.shapes.large
             ) {
-                Icon(
-                    if (applied) Icons.Rounded.Check else Icons.Rounded.Palette,
-                    null, modifier = Modifier.size(16.dp)
-                )
+                Icon(if (applied) Icons.Rounded.Check else Icons.Rounded.Palette, null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (applied) "Applied ✓" else "Apply Custom Theme", fontWeight = FontWeight.Bold)
+                Text(if (applied) "Applied ✓" else "Apply Theme", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
             }
         }
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GITHUB TOKEN ONBOARDING  (shown after splash when no token is saved)
@@ -1426,7 +1732,7 @@ fun GitHubTokenOnboarding(
     var tokenInput by remember { mutableStateOf("") }
 
     Box(
-        modifier         = Modifier.fillMaxSize().background(t.bgPrimary),
+        modifier         = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -1437,43 +1743,35 @@ fun GitHubTokenOnboarding(
             verticalArrangement   = Arrangement.spacedBy(20.dp)
         ) {
             // Icon
-            Box(
-                modifier         = Modifier
-                    .size(76.dp)
-                    .clip(CircleShape)
-                    .background(t.accentContainer),
-                contentAlignment = Alignment.Center
+            FilledIconButton(
+                onClick  = {},
+                modifier = Modifier.size(76.dp)
             ) {
-                Icon(
-                    Icons.Rounded.Lock,
-                    null,
-                    tint     = t.accent,
-                    modifier = Modifier.size(36.dp)
-                )
+                Icon(Icons.Rounded.Lock, null, modifier = Modifier.size(36.dp))
             }
 
             Text(
                 "GitHub Search",
-                fontSize   = 24.sp,
+                style      = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
-                color      = t.textPrimary,
+                color      = MaterialTheme.colorScheme.onSurface,
                 textAlign  = TextAlign.Center
             )
 
             Text(
                 "To search apps directly on GitHub, add your Personal Access Token.\n\nYou can skip this and add it later in Settings.",
-                fontSize  = 14.sp,
-                color     = t.textSecondary,
-                textAlign = TextAlign.Center,
+                style      = MaterialTheme.typography.bodyMedium,
+                color      = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign  = TextAlign.Center,
                 lineHeight = 21.sp
             )
 
             // How to generate a token
-            Surface(
-                shape  = RoundedCornerShape(14.dp),
-                color  = t.bgSurface,
-                border = BorderStroke(0.5.dp, t.borderVariant),
-                modifier = Modifier.fillMaxWidth()
+            ElevatedCard(
+                shape     = MaterialTheme.shapes.large,
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+                colors    = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier  = Modifier.fillMaxWidth()
             ) {
                 Column(
                     modifier            = Modifier.padding(16.dp),
@@ -1483,12 +1781,12 @@ fun GitHubTokenOnboarding(
                         verticalAlignment     = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(Icons.Rounded.Info, null, tint = t.accent, modifier = Modifier.size(15.dp))
+                        Icon(Icons.Rounded.Info, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
                         Text(
                             "How to generate a token",
-                            fontSize   = 13.sp,
+                            style      = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
-                            color      = t.textPrimary
+                            color      = MaterialTheme.colorScheme.onSurface
                         )
                     }
                     val steps = listOf(
@@ -1509,20 +1807,20 @@ fun GitHubTokenOnboarding(
                                     .padding(top = 2.dp)
                                     .size(18.dp)
                                     .clip(CircleShape)
-                                    .background(t.accentContainer),
+                                    .background(MaterialTheme.colorScheme.primaryContainer),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     "${i + 1}",
-                                    fontSize   = 10.sp,
+                                    style      = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.Bold,
-                                    color      = t.accent
+                                    color      = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                             }
                             Text(
                                 step,
-                                fontSize   = 12.sp,
-                                color      = t.textSecondary,
+                                style      = MaterialTheme.typography.labelSmall,
+                                color      = MaterialTheme.colorScheme.onSurfaceVariant,
                                 lineHeight = 18.sp,
                                 modifier   = Modifier.weight(1f)
                             )
@@ -1534,18 +1832,18 @@ fun GitHubTokenOnboarding(
             TextField(
                 value         = tokenInput,
                 onValueChange = { tokenInput = it },
-                modifier      = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
-                placeholder   = { Text("ghp_xxxxxxxxxxxx", color = t.textSecondary) },
+                modifier      = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium),
+                placeholder   = { Text("ghp_xxxxxxxxxxxx", style = MaterialTheme.typography.bodyMedium) },
                 singleLine    = true,
                 visualTransformation = if (tokenInput.length > 4)
                     PasswordVisualTransformation() else VisualTransformation.None,
                 colors = TextFieldDefaults.colors(
-                    focusedContainerColor   = t.bgSurfaceAlt,
-                    unfocusedContainerColor = t.bgSurfaceAlt,
-                    focusedIndicatorColor   = t.accent,
+                    focusedContainerColor   = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    focusedIndicatorColor   = MaterialTheme.colorScheme.primary,
                     unfocusedIndicatorColor = Color.Transparent,
-                    focusedTextColor        = t.textPrimary,
-                    unfocusedTextColor      = t.textPrimary
+                    focusedTextColor        = MaterialTheme.colorScheme.onSurface,
+                    unfocusedTextColor      = MaterialTheme.colorScheme.onSurface
                 )
             )
 
@@ -1553,19 +1851,18 @@ fun GitHubTokenOnboarding(
                 onClick  = {
                     if (tokenInput.isNotBlank()) onSave(tokenInput.trim()) else onSkip()
                 },
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape    = RoundedCornerShape(14.dp),
-                colors   = ButtonDefaults.buttonColors(containerColor = t.accent)
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape    = MaterialTheme.shapes.large
             ) {
                 Text(
                     if (tokenInput.isNotBlank()) "Save & Continue" else "Continue",
-                    fontWeight = FontWeight.Bold,
-                    fontSize   = 16.sp
+                    style      = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
                 )
             }
 
             TextButton(onClick = onSkip) {
-                Text("Skip for now", color = t.textSecondary, fontSize = 14.sp)
+                Text("Skip for now", style = MaterialTheme.typography.labelLarge)
             }
         }
     }

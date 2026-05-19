@@ -8,6 +8,8 @@ import kotlinx.coroutines.isActive
 import android.app.DownloadManager
 import android.content.Context
 import android.content.pm.PackageManager
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import android.net.Uri
 import android.os.Environment
 import androidx.compose.runtime.getValue
@@ -18,6 +20,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.Gson
+import com.google.gson.JsonArray
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -46,32 +49,9 @@ enum class AppSource(val label: String, val colorHex: Long) {
     CODEBERG ("Codeberg",    0xFF2185D0L),
     FDROID   ("F-Droid",     0xFF1976D2L),
     IZZY     ("IzzyOnDroid", 0xFF0D47A1L),
-    FLATHUB  ("Flathub",     0xFF4A86CFL),
-    WINGET   ("Winget",      0xFF0078D4L)
+    FLATHUB  ("Flathub",     0xFFEEEEEEL),
+    WINGET   ("Winget",      0xFFFFD966L)
 }
-
-val PLATFORM_SUBCATEGORIES = mapOf(
-    AppPlatform.ANDROID to listOf(
-        "Productivity", "AI Tools", "Browsers", "Media", "File Managers",
-        "Customization", "Launchers", "Root Apps", "Tablet Optimized", "Developer Tools"
-    ),
-    AppPlatform.WINDOWS to listOf(
-        "Utilities", "Gaming", "Design", "Developer Tools", "Video Editing",
-        "Security", "Networking", "Productivity"
-    ),
-    AppPlatform.LINUX to listOf(
-        "Distros", "Terminal Tools", "Hyprland Tools", "Containers",
-        "System Utilities", "Monitoring", "Developer Tools", "AI Tools"
-    ),
-    AppPlatform.TV to listOf(
-        "Streaming", "Media Players", "Remote Tools", "IPTV",
-        "Gaming", "Kids", "Live TV", "Utility Apps"
-    ),
-    AppPlatform.IOS to listOf(
-        "Productivity", "Jailbreak Tools", "Design", "Media", "Browsers",
-        "Notes", "AI Tools", "Utilities", "Developer Apps", "Automation"
-    )
-)
 
 data class GitHubRepo(
     val id: Long = 0, val name: String = "", val full_name: String = "",
@@ -99,6 +79,7 @@ data class ReleaseAsset(
 data class InstallState(
     val isLoadingRelease : Boolean = false,
     val release          : Release? = null,
+    val releases         : List<Release> = emptyList(),
     val apkAsset         : ReleaseAsset? = null,
     val smartInstall     : SmartInstallResult? = null,
     val trustScore       : TrustScore? = null,
@@ -119,29 +100,24 @@ data class UserProfile(
 )
 data class HistoryItem(val repo: GitHubRepo, val viewedAt: Long = System.currentTimeMillis())
 data class AppSettings(
-    val language    : String  = "English",
-    val githubToken : String  = "",
-    val sortBy      : String  = "Stars",
-    val fontName    : String  = "Default",
-    val themeMode   : String  = "System",
-    val amoledBlack : Boolean = false
+    val language          : String  = "English",
+    val githubToken       : String  = "",
+    val sortBy            : String  = "Stars",
+    val fontName          : String  = "Default",
+    val themeMode         : String  = "System",
+    val amoledBlack       : Boolean = false,
+    val followSystemMonet : Boolean = false
 )
 
-// User-editable custom theme — colors stored as "#RRGGBB" hex strings
+// User-editable custom theme — accent is required, extra fields override auto-derived colors
 data class CustomThemeData(
-    val bgPrimary         : String = "#0F0E13",
-    val bgSurface         : String = "#1A1825",
-    val bgSurfaceAlt      : String = "#231F30",
-    val bgSurfaceHigh     : String = "#2D2840",
-    val textPrimary       : String = "#E6E1E5",
-    val textSecondary     : String = "#CAC4D0",
-    val accent            : String = "#D0BCFF",
-    val accentAlt         : String = "#CCC2DC",
-    val accentContainer   : String = "#4F378B",
-    val onAccentContainer : String = "#EADDFF",
-    val border            : String = "#938F99",
-    val borderVariant     : String = "#49454F",
-    val isDark            : Boolean = true
+    val accentHex      : String  = "#D0BCFF",
+    val isDark         : Boolean = true,
+    val bgHex          : String  = "",   // "" = auto-derived from accent
+    val surfaceHex     : String  = "",
+    val onSurfaceHex   : String  = "",
+    val secondaryHex   : String  = "",
+    val tertiaryHex    : String  = ""
 )
 
 data class InstallHistoryEntry(
@@ -162,6 +138,12 @@ data class UpdateInfo(
     val changelog  : String
 )
 
+data class SelfUpdateInfo(
+    val latestVersion : String,
+    val apkUrl        : String,
+    val changelog     : String
+)
+
 data class ReadmeResponse(
     val content  : String = "",
     val encoding : String = ""
@@ -169,7 +151,6 @@ data class ReadmeResponse(
 
 data class UiState(
     val refreshToken           : Int                     = 0,
-    val isSetupDone            : Boolean?                = null,
     val trending               : List<GitHubRepo>        = emptyList(),
     val media                  : List<GitHubRepo>        = emptyList(),
     val tools                  : List<GitHubRepo>        = emptyList(),
@@ -212,8 +193,11 @@ data class UiState(
     val useMonet               : Boolean                 = false,
     val customTheme            : CustomThemeData         = CustomThemeData(),
     val categoryViewCounts     : Map<String, Int>        = emptyMap(),
-    val translatedDescriptions : Map<Long, String>       = emptyMap(),
-    val isTranslating          : Map<Long, Boolean>      = emptyMap(),
+    val translatedDescriptions  : Map<Long, String>       = emptyMap(),
+    val isTranslating           : Map<Long, Boolean>      = emptyMap(),
+    val translatedReleaseBodies : Map<Long, String>       = emptyMap(),
+    val isTranslatingRelease    : Map<Long, Boolean>      = emptyMap(),
+    val notifsDismissed         : Boolean                 = false,
     val favourites             : List<GitHubRepo>        = emptyList(),
     val githubUsername         : String                  = "",
     val installHistory         : List<InstallHistoryEntry> = emptyList(),
@@ -232,24 +216,26 @@ data class UiState(
     val fdroidApps      : List<GitHubRepo>        = emptyList(),
     val izzyApps        : List<GitHubRepo>        = emptyList(),
     val flathubApps     : List<GitHubRepo>        = emptyList(),
-    val wingetApps      : List<GitHubRepo>        = emptyList(),
+    val wingetApps          : List<GitHubRepo>        = emptyList(),
+    val selfUpdateInfo      : SelfUpdateInfo?         = null,
+    val selfUpdateDismissed : Boolean                 = false,
 )
 
-// ── Translation ───────────────────────────────────────────────────────────────
-data class MyMemoryResponse(val responseData: MyMemoryData, val responseStatus: Int = 0)
-data class MyMemoryData(val translatedText: String = "")
-interface TranslationService {
-    @GET("get")
+interface GTranslateService {
+    @GET("translate_a/single")
     suspend fun translate(
-        @Query("q") text: String,
-        @Query("langpair") langPair: String
-    ): MyMemoryResponse
+        @Query("client") client: String,
+        @Query("sl") sl: String,
+        @Query("tl") tl: String,
+        @Query("dt") dt: String,
+        @Query("q") q: String
+    ): JsonArray
 }
-object TranslationClient {
-    val service: TranslationService = Retrofit.Builder()
-        .baseUrl("https://api.mymemory.translated.net/")
+object GTranslateClient {
+    val service: GTranslateService = Retrofit.Builder()
+        .baseUrl("https://translate.googleapis.com/")
         .addConverterFactory(GsonConverterFactory.create()).build()
-        .create(TranslationService::class.java)
+        .create(GTranslateService::class.java)
 }
 
 // ── GitHub API ────────────────────────────────────────────────────────────────
@@ -290,7 +276,7 @@ interface GitHubService {
 }
 
 object RetrofitClient {
-    var authToken: String = ""
+    @Volatile var authToken: String = ""
     private val httpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
         .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
@@ -388,6 +374,7 @@ fun AppEntry.toGitHubRepo(): GitHubRepo {
         "codeberg" -> AppSource.CODEBERG
         "flathub"  -> AppSource.FLATHUB
         "winget"   -> AppSource.WINGET
+        "izzy"     -> AppSource.IZZY
         else       -> AppSource.GITHUB
     }
     val pkg = id.substringAfter(":")
@@ -399,19 +386,36 @@ fun AppEntry.toGitHubRepo(): GitHubRepo {
         "fdroid"   -> kotlin.math.abs(id.hashCode()).toLong() + 7_000_000_000L
         "flathub"  -> kotlin.math.abs(id.hashCode()).toLong() + 6_000_000_000L
         "winget"   -> kotlin.math.abs(id.hashCode()).toLong() + 5_000_000_000L
+        "github"   -> pkg.toLongOrNull() ?: kotlin.math.abs(id.hashCode()).toLong()
+        "izzy"     -> pkg.toLongOrNull()?.plus(4_000_000_000L)
+                      ?: (kotlin.math.abs(id.hashCode()).toLong() + 4_000_000_000L)
         else       -> kotlin.math.abs(id.hashCode()).toLong()
     }
+    // GitHub and IzzyOnDroid CDN entries encode owner in the homepage URL
+    val ghOwner = if (source == "github" || source == "izzy") {
+        homepage.removePrefix("https://github.com/").substringBefore("/").takeIf { it.isNotBlank() }
+    } else null
     val owner = when (source) {
         "gitlab", "codeberg" -> pkg.substringBefore("/").ifEmpty { source }
+        "github", "izzy"     -> ghOwner ?: source
         else                 -> source
+    }
+    val fullName = when (source) {
+        "github", "izzy" -> if (ghOwner != null) "$ghOwner/$name" else pkg
+        else             -> pkg
+    }
+    val resolvedUrl = when {
+        source == "fdroid" && !homepage.contains("f-droid.org") ->
+            "https://f-droid.org/packages/$pkg"
+        else -> homepage
     }
     return GitHubRepo(
         id               = repoId,
         name             = name,
-        full_name        = pkg,
+        full_name        = fullName,
         description      = summary.ifEmpty { null },
         stargazers_count = stars,
-        html_url         = homepage,
+        html_url         = resolvedUrl,
         owner            = RepoOwner(login = owner, avatar_url = icon),
         source           = appSource,
         apkUrl           = apkUrl,
@@ -422,11 +426,12 @@ fun AppEntry.toGitHubRepo(): GitHubRepo {
 interface CodebergService {
     @GET("repos/search")
     suspend fun searchRepos(
-        @Query("q")     query : String = "android",
-        @Query("sort")  sort  : String = "stars",
-        @Query("order") order : String = "desc",
-        @Query("limit") limit : Int    = 20,
-        @Query("page")  page  : Int    = 1
+        @Query("q")     query : String  = "android",
+        @Query("topic") topic : Boolean = false,
+        @Query("sort")  sort  : String  = "stars",
+        @Query("order") order : String  = "desc",
+        @Query("limit") limit : Int     = 20,
+        @Query("page")  page  : Int     = 1
     ): CodebergSearchResponse
 }
 
@@ -436,7 +441,12 @@ object CodebergClient {
         .client(OkHttpClient.Builder()
             .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .build())
+            .addInterceptor { chain ->
+                chain.proceed(chain.request().newBuilder()
+                    .addHeader("Accept", "application/json")
+                    .addHeader("User-Agent", "VyxelApps/1.0")
+                    .build())
+            }.build())
         .addConverterFactory(GsonConverterFactory.create())
         .build().create(CodebergService::class.java)
 }
@@ -496,24 +506,129 @@ object FlathubClient {
         .build().create(FlathubService::class.java)
 }
 
+// ── IzzyOnDroid live client ───────────────────────────────────────────────────
+// Streams the F-Droid index-v1.json and returns the first N apps.
+// The streaming parser skips the large "packages" object without loading it.
+data class IzzyFDroidApp(
+    val packageName : String  = "",
+    val name        : String  = "",
+    val summary     : String? = null,
+    val icon        : String? = null,
+    val sourceCode  : String? = null,
+    val webSite     : String? = null
+)
+
+object IzzyOnDroidClient {
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            chain.proceed(chain.request().newBuilder()
+                .addHeader("User-Agent", "VyxelApps/1.0").build())
+        }.build()
+
+    @Volatile private var cache   : List<GitHubRepo>? = null
+    @Volatile private var cacheAt : Long              = 0L
+    private val CACHE_TTL = 6 * 60 * 60 * 1000L
+
+    suspend fun getApps(limit: Int = 50): List<GitHubRepo> =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val c = cache
+            if (c != null && System.currentTimeMillis() - cacheAt < CACHE_TTL)
+                return@withContext c.take(limit)
+            try {
+                val req  = okhttp3.Request.Builder()
+                    .url("https://apt.izzysoft.de/fdroid/repo/index-v1.json").build()
+                val resp = http.newCall(req).execute()
+                if (!resp.isSuccessful) return@withContext emptyList()
+                val body = resp.body ?: return@withContext emptyList()
+                val gson = Gson()
+                val jr   = com.google.gson.stream.JsonReader(body.charStream())
+                val apps = mutableListOf<IzzyFDroidApp>()
+                jr.beginObject()
+                while (jr.hasNext()) {
+                    if (jr.nextName() == "apps") {
+                        jr.beginArray()
+                        while (jr.hasNext() && apps.size < limit) {
+                            try { apps.add(gson.fromJson(jr, IzzyFDroidApp::class.java)) }
+                            catch (_: Exception) { try { jr.skipValue() } catch (_: Exception) {} }
+                        }
+                        while (jr.hasNext()) { try { jr.skipValue() } catch (_: Exception) { break } }
+                        jr.endArray()
+                    } else {
+                        try { jr.skipValue() } catch (_: Exception) {}
+                    }
+                }
+                try { jr.endObject() } catch (_: Exception) {}
+                body.close()
+                val result = apps.filter { it.packageName.isNotEmpty() }.map { app ->
+                    val icon = app.icon?.takeIf { it.isNotBlank() }
+                        ?.let { "https://apt.izzysoft.de/fdroid/repo/$it" } ?: ""
+                    val home = app.sourceCode?.takeIf { it.isNotBlank() }
+                        ?: app.webSite?.takeIf { it.isNotBlank() }
+                        ?: "https://apt.izzysoft.de/fdroid/index/apk/${app.packageName}"
+                    GitHubRepo(
+                        id               = kotlin.math.abs(app.packageName.hashCode()).toLong() + 4_000_000_000L,
+                        name             = app.name.ifEmpty { app.packageName },
+                        full_name        = app.packageName,
+                        description      = app.summary?.takeIf { it.isNotBlank() },
+                        stargazers_count = 0,
+                        html_url         = home,
+                        owner            = RepoOwner(
+                            login      = app.packageName.substringAfterLast("."),
+                            avatar_url = icon
+                        ),
+                        source           = AppSource.IZZY
+                    )
+                }
+                cache   = result
+                cacheAt = System.currentTimeMillis()
+                result
+            } catch (_: Exception) { emptyList() }
+        }
+}
+
 // ── Preferences persistence ───────────────────────────────────────────────────
 class PreferencesManager(context: Context) {
     private val prefs = context.getSharedPreferences("vyxel_prefs", Context.MODE_PRIVATE)
     private val gson  = Gson()
 
-    fun saveSetupDone()  = prefs.edit().putBoolean("setup_done", true).apply()
-    fun isSetupDone()    = prefs.getBoolean("setup_done", false)
-    fun saveLanguageCode(code: String) = prefs.edit().putString("user_language_code", code).apply()
+    private val tokenPrefs = try {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            context,
+            "vyxel_secure",
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    } catch (_: Exception) { null }
 
-    fun saveAppSettings(s: AppSettings) =
-        prefs.edit().putString("app_settings_v2", gson.toJson(s)).apply()
-    fun loadAppSettings(): AppSettings = fromJson("app_settings_v2") ?: AppSettings()
+    private fun saveToken(token: String) =
+        tokenPrefs?.edit()?.putString("github_token", token)?.apply()
+            ?: prefs.edit().putString("github_token_fallback", token).apply()
+
+    private fun loadToken(): String =
+        tokenPrefs?.getString("github_token", null)
+            ?: prefs.getString("github_token_fallback", "") ?: ""
+
+    fun saveLanguageCode(code: String) = prefs.edit().putString("user_language_code", code).apply()
 
     fun saveProfile(p: UserProfile) = prefs.edit().putString("profile", gson.toJson(p)).apply()
     fun loadProfile(): UserProfile  = fromJson("profile") ?: UserProfile()
 
-    fun saveSettings(s: AppSettings) = prefs.edit().putString("settings", gson.toJson(s)).apply()
-    fun loadSettings(): AppSettings  = fromJson("settings") ?: AppSettings()
+    fun saveSettings(s: AppSettings) {
+        saveToken(s.githubToken)
+        prefs.edit().putString("settings", gson.toJson(s.copy(githubToken = ""))).apply()
+    }
+    fun loadSettings(): AppSettings {
+        val s = fromJson<AppSettings>("settings")
+            ?: fromJson<AppSettings>("app_settings_v2")
+            ?: AppSettings()
+        return s.copy(githubToken = loadToken())
+    }
 
     fun saveTheme(t: ThemeName)  = prefs.edit().putString("theme", t.name).apply()
     fun loadTheme(): ThemeName   = try {
@@ -578,6 +693,27 @@ class PreferencesManager(context: Context) {
         prefs.edit().putStringSet("ignored_versions", v).apply()
     fun loadIgnoredVersions(): Set<String> =
         prefs.getStringSet("ignored_versions", emptySet()) ?: emptySet()
+
+    fun saveNotifsDismissed(v: Boolean) = prefs.edit().putBoolean("notifs_dismissed", v).apply()
+    fun loadNotifsDismissed(): Boolean  = prefs.getBoolean("notifs_dismissed", false)
+
+    fun saveUpdates(updates: List<UpdateInfo>) =
+        prefs.edit().putString("cached_updates", gson.toJson(updates)).apply()
+    fun loadUpdates(): List<UpdateInfo> {
+        val json = prefs.getString("cached_updates", null) ?: return emptyList()
+        return try {
+            gson.fromJson(json, object : TypeToken<List<UpdateInfo>>() {}.type) ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+    }
+
+    fun saveFavourites(favs: List<GitHubRepo>) =
+        prefs.edit().putString("favourites", gson.toJson(favs)).apply()
+    fun loadFavourites(): List<GitHubRepo> {
+        val json = prefs.getString("favourites", null) ?: return emptyList()
+        return try {
+            gson.fromJson(json, object : TypeToken<List<GitHubRepo>>() {}.type) ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+    }
 }
 
 // ── Smart APK detection ───────────────────────────────────────────────────────
@@ -693,23 +829,24 @@ data class AppCollection(
     val emoji    : String,
     val title    : String,
     val query    : String,
-    val subtitle : String = ""
+    val subtitle : String = "",
+    val iconRes:Int? = null
 )
 
 val COLLECTIONS = listOf(
-    AppCollection("🔒", "Privacy Essentials",  "topic:android privacy",              "Essential privacy tools"),
-    AppCollection("🎵", "Best Media Apps",      "topic:android media player",         "The best for your media"),
-    AppCollection("🛠",  "Root & Magisk Tools", "topic:android magisk root",           "Unlock your device"),
-    AppCollection("📖", "Reading & E-Books",    "topic:android ebook reader",          "Books and reading apps"),
-    AppCollection("🌐", "Browsers",             "topic:android browser privacy",       "Open-source browsers"),
-    AppCollection("💬", "Messaging",            "topic:android messaging privacy",     "Private messaging apps"),
-    AppCollection("📸", "Camera & Gallery",     "topic:android camera",                "Camera and photo apps"),
-    AppCollection("🎮", "Emulators",            "topic:android emulator game",         "Game emulators"),
-    AppCollection("🔧", "Dev Tools",            "topic:android developer-tools",       "Tools for developers"),
-    AppCollection("☁️", "Sync & Backup",        "topic:android backup sync",           "Backup your data"),
-    AppCollection("🌐", "PWA Apps",          "topic:pwa progressive-web-app stars:>100",  "Progressive web apps"),
-    AppCollection("🤖", "AI & ML Apps",       "topic:android machine-learning stars:>100", "AI-powered apps"),
-    AppCollection("🎨", "Customization",       "topic:android launcher theme stars:>50",    "Launchers & themes"),
+    AppCollection("🔒", "Privacy Essentials",  "topic:android privacy",              "Essential privacy tools", R.drawable.ic_priv),
+    AppCollection("🎵", "Best Media Apps",      "topic:android media player",         "The best for your media", R.drawable.ic_med),
+    AppCollection("🛠",  "Root & Magisk Tools", "topic:android magisk root",           "Unlock your device", R.drawable.ic_mag),
+    AppCollection("📖", "Reading & E-Books",    "topic:android ebook reader",          "Books and reading apps", R.drawable.ic_book),
+    AppCollection("🌐", "Browsers",             "topic:android browser privacy",       "Open-source browsers", R.drawable.ic_brow),
+    AppCollection("💬", "Messaging",            "topic:android messaging privacy",     "Private messaging apps", R.drawable.ic_mes),
+    AppCollection("📸", "Camera & Gallery",     "topic:android camera",                "Camera and photo apps", R.drawable.ic_cam),
+    AppCollection("🎮", "Emulators",            "topic:android emulator game",         "Game emulators", R.drawable.ic_emu),
+    AppCollection("🔧", "Dev Tools",            "topic:android developer-tools",       "Tools for developers", R.drawable.ic_dev),
+    AppCollection("☁️", "Sync & Backup",        "topic:android backup sync",           "Backup your data", R.drawable.ic_syc),
+    AppCollection("🌐", "PWA Apps",          "topic:pwa progressive-web-app stars:>100",  "Progressive web apps", R.drawable.ic_pwa),
+    AppCollection("🤖", "AI & ML Apps",       "topic:android machine-learning stars:>100", "AI-powered apps",R.drawable.ic_ai),
+    AppCollection("🎨", "Customization",       "topic:android launcher theme stars:>50",    "Launchers & themes", R.drawable.ic_cus),
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -762,6 +899,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             AppSource.CODEBERG -> "codeberg"
             AppSource.FLATHUB  -> "flathub"
             AppSource.WINGET   -> "winget"
+            AppSource.GITHUB   -> "github"
+            AppSource.IZZY     -> "izzy"
             else               -> null
         }
         if (cdnKey != null) {
@@ -772,6 +911,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 AppSource.CODEBERG -> state.codebergApps
                 AppSource.FLATHUB  -> state.flathubApps
                 AppSource.WINGET   -> state.wingetApps
+                AppSource.IZZY     -> state.izzyApps
+                AppSource.GITHUB   -> (state.trending + state.media + state.tools + state.games +
+                                       state.browsers + state.productivity + state.security + state.devtools +
+                                       state.photoVideo + state.music + state.finance + state.education +
+                                       state.fitness + state.artDesign + state.news + state.social +
+                                       state.cloudStorage + state.cooking).distinctBy { it.id }
                 else               -> emptyList()
             }
             state = state.copy(
@@ -811,7 +956,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     AppSource.CODEBERG -> launch {
                         try {
-                            val repos = CodebergClient.service.searchRepos(limit = 30).data
+                            val repos = CodebergClient.service.searchRepos(query = "android", topic = true, limit = 30).data
                             mutex.withLock { mergeSource(repos.map { it.toUnifiedRepo() }) }
                         } catch (_: Exception) {}
                     }
@@ -838,6 +983,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             mutex.withLock { mergeSource(hits) }
                         } catch (_: Exception) {}
                     }
+                    // GitHub: live API fallback (uses user's token for 5000/hr)
+                    AppSource.GITHUB -> launch {
+                        try {
+                            val items = RetrofitClient.service.searchRepos(
+                                "topic:android stars:>100", perPage = 30
+                            ).items.map { it.copy(source = AppSource.GITHUB) }
+                            mutex.withLock { mergeSource(items) }
+                        } catch (_: Exception) {}
+                    }
+                    // IzzyOnDroid: stream directly from F-Droid index (CDN fallback)
+                    AppSource.IZZY -> launch {
+                        try {
+                            val apps = IzzyOnDroidClient.getApps(100)
+                            mutex.withLock { mergeSource(apps) }
+                        } catch (_: Exception) {}
+                    }
                     else -> null
                 }
                 j1.join(); j2?.join()
@@ -848,53 +1009,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         } else {
-            when (source) {
-                AppSource.GITHUB -> {
-                    val githubApps = (state.trending + state.media + state.tools + state.games +
-                            state.browsers + state.productivity + state.security + state.devtools +
-                            state.photoVideo + state.music + state.finance + state.education +
-                            state.fitness + state.artDesign + state.news + state.social +
-                            state.cloudStorage + state.cooking)
-                        .filter { it.source == AppSource.GITHUB || it.source == null }
-                        .distinctBy { it.id }
-                        .sortedByDescending { it.stargazers_count }
-                    if (githubApps.isNotEmpty()) {
-                        state = state.copy(
-                            seeAllTitle     = "GitHub Apps",
-                            seeAllApps      = githubApps,
-                            seeAllQuery     = "topic:android apk stars:>500",
-                            seeAllPage      = 1,
-                            seeAllSource    = null,
-                            isLoadingSeeAll = false
-                        )
-                    } else {
-                        openSeeAll("GitHub Apps", "topic:android apk stars:>500")
-                    }
-                }
-                AppSource.IZZY -> {
-                    // Show preloaded IzzyOnDroid apps from home screen, then try API
-                    val izzyPreloaded = state.izzyApps
-                    state = state.copy(
-                        seeAllTitle     = "IzzyOnDroid Apps",
-                        seeAllApps      = izzyPreloaded,
-                        seeAllQuery     = "user:IzzyOnDroid stars:>10",
-                        seeAllPage      = 1,
-                        seeAllSource    = null,
-                        isLoadingSeeAll = izzyPreloaded.isEmpty()
-                    )
-                    if (izzyPreloaded.isEmpty()) {
-                        viewModelScope.launch {
-                            try {
-                                val r = RetrofitClient.service.searchRepos("user:IzzyOnDroid stars:>10", perPage = 30)
-                                state = state.copy(seeAllApps = r.items, isLoadingSeeAll = false)
-                            } catch (_: Exception) {
-                                state = state.copy(isLoadingSeeAll = false)
-                            }
-                        }
-                    }
-                }
-                else -> openSeeAll(source.label, "topic:android stars:>50")
-            }
+            openSeeAll(source.label, "topic:android stars:>50")
         }
     }
 
@@ -921,7 +1036,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val newFav = if (fav.any { it.id == repo.id }) fav.filter { it.id != repo.id }
         else listOf(repo) + fav
         state = state.copy(favourites = newFav)
-        prefs.saveHistory(newFav.map { HistoryItem(it) })
+        prefs.saveFavourites(newFav)
     }
 
     fun setGithubUsername(name: String) { state = state.copy(githubUsername = name) }
@@ -937,14 +1052,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     init {
-        val savedSettings = prefs.loadAppSettings()
+        val savedSettings = prefs.loadSettings()
         RetrofitClient.authToken = savedSettings.githubToken
         MetadataManager.init(ctx)
         state = state.copy(
-            isSetupDone        = true,
             settings           = savedSettings,
             profile            = prefs.loadProfile(),
             history            = prefs.loadHistory(),
+            favourites         = prefs.loadFavourites(),
             accentColor        = prefs.loadAccentColor(),
             useMonet           = prefs.loadUseMonet(),
             themeName          = prefs.loadTheme(),
@@ -952,6 +1067,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             categoryViewCounts = prefs.loadCategoryViews(),
             installHistory     = prefs.loadInstallHistory(),
             ignoredVersions    = prefs.loadIgnoredVersions(),
+            updates            = prefs.loadUpdates(),
+            notifsDismissed    = prefs.loadNotifsDismissed(),
             platform           = prefs.loadSearchPlatform(),
             selectedSubCategories = prefs.loadSearchSubCategories()
         )
@@ -960,6 +1077,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         reconstructInstallStatesFromHistory()
         loadAll()
+        checkSelfUpdate()
     }
 
     private suspend fun <T> safeApi(block: suspend () -> T): T? = try {
@@ -1019,21 +1137,86 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             loadPage = (loadPage % 8) + 1
             state = state.copy(isLoading = true, error = null, trendingPage = 1, refreshToken = state.refreshToken + 1)
 
-            // ── Batch 1: primary rows — all 4 calls in parallel ──────────────
+            // ── Phase 1: All CDN sources in parallel ─────────────────────────
+            // GitHub CDN → category rows  |  Other CDN sources → source rows
             try {
-                val tD = async { searchCached("topic:android apk stars:>100",          perPage = 20, page = loadPage) }
-                val mD = async { searchCached("topic:android media player stars:>50",  perPage = 20, page = loadPage) }
-                val uD = async { searchCached("topic:android utility tool stars:>50",  perPage = 20, page = loadPage) }
-                val gD = async { searchCached("topic:android game emulator stars:>50", perPage = 20, page = loadPage) }
-                val t = tD.await(); val m = mD.await(); val u = uD.await(); val g = gD.await()
+                val c = MetadataManager.get()
+
+                suspend fun cdnSource(key: String): List<GitHubRepo> {
+                    val b = try { c.browseSource(key, 1).apps.map { it.toGitHubRepo() } }
+                             catch (_: Exception) { emptyList() }
+                    if (b.isNotEmpty()) return b
+                    return try { c.search("", source = key).take(50).map { it.toGitHubRepo() } }
+                           catch (_: Exception) { emptyList() }
+                }
+
+                val ghD = async {
+                    val b = try { c.browseSource("github", 1).apps } catch (_: Exception) { emptyList<com.vythera.vyxelapps.api.AppEntry>() }
+                    if (b.isNotEmpty()) b
+                    else try { c.search("", source = "github").take(200) } catch (_: Exception) { emptyList() }
+                }
+                val glD = async { cdnSource("gitlab").ifEmpty { try { GitLabClient.service.searchProjects(query = "android", perPage = 30).map { it.toUnifiedRepo() } } catch (_: Exception) { emptyList() } } }
+                val cbD = async { cdnSource("codeberg").ifEmpty { try { CodebergClient.service.searchRepos(query = "android", topic = true, limit = 30).data.map { it.toUnifiedRepo() } } catch (_: Exception) { emptyList() } } }
+                val fdD = async { cdnSource("fdroid") }
+                val fhD = async {
+                    val x = cdnSource("flathub")
+                    if (x.isNotEmpty()) x else try { FlathubClient.service.getPopular().hits?.map { it.toUnifiedRepo() } ?: emptyList() } catch (_: Exception) { emptyList() }
+                }
+                val wgD = async { cdnSource("winget") }
+                val izD = async {
+                    val b = try { c.browseSource("izzy", 1).apps.map { it.toGitHubRepo() } } catch (_: Exception) { emptyList() }
+                    if (b.isNotEmpty()) return@async b
+                    val s = try { c.search("", source = "izzy").take(50).map { it.toGitHubRepo() } } catch (_: Exception) { emptyList() }
+                    if (s.isNotEmpty()) return@async s
+                    try { IzzyOnDroidClient.getApps(50) } catch (_: Exception) { emptyList() }
+                }
+
+                val ghEntries = ghD.await()
+                val gl = glD.await(); val cb = cbD.await(); val fd = fdD.await()
+                val fh = fhD.await(); val wg = wgD.await(); val iz = izD.await()
+
                 if (!isActive) { state = state.copy(isLoading = false); return@launch }
-                state = state.copy(
-                    trending  = t?.items?.shuffled() ?: emptyList(),
-                    media     = m?.items?.shuffled() ?: emptyList(),
-                    tools     = u?.items?.shuffled() ?: emptyList(),
-                    games     = g?.items?.shuffled() ?: emptyList(),
+
+                // Distribute CDN GitHub apps to category rows by keyword matching.
+                // Falls back to full CDN list for any category that has no keyword matches.
+                fun List<com.vythera.vyxelapps.api.AppEntry>.toRows(vararg kws: String): List<GitHubRepo> {
+                    val matched = filter { e ->
+                        kws.any { k ->
+                            e.categories.any { cat -> k in cat.lowercase() } ||
+                            k in e.summary.lowercase() || k in e.name.lowercase()
+                        }
+                    }
+                    return (if (matched.isNotEmpty()) matched else this).shuffled().take(20).map { it.toGitHubRepo() }
+                }
+
+                var ns = state.copy(
+                    gitlabApps = gl, codebergApps = cb, fdroidApps = fd,
+                    flathubApps = fh, wingetApps = wg, izzyApps = iz,
                     isLoading = false
                 )
+                if (ghEntries.isNotEmpty()) {
+                    ns = ns.copy(
+                        trending     = ghEntries.shuffled().take(20).map { it.toGitHubRepo() },
+                        media        = ghEntries.toRows("media", "player", "video", "stream"),
+                        tools        = ghEntries.toRows("tool", "utility", "manager"),
+                        games        = ghEntries.toRows("game", "emulat"),
+                        browsers     = ghEntries.toRows("browser"),
+                        productivity = ghEntries.toRows("productivity", "note", "office", "task"),
+                        security     = ghEntries.toRows("security", "privacy", "encrypt"),
+                        devtools     = ghEntries.toRows("developer", "dev-tool", "terminal", "ssh"),
+                        photoVideo   = ghEntries.toRows("photo", "camera", "gallery", "image"),
+                        music        = ghEntries.toRows("music", "podcast", "radio"),
+                        finance      = ghEntries.toRows("finance", "banking", "budget", "money"),
+                        education    = ghEntries.toRows("education", "learn", "study", "language"),
+                        fitness      = ghEntries.toRows("fitness", "health", "workout", "exercise"),
+                        artDesign    = ghEntries.toRows("art", "design", "draw", "creative"),
+                        news         = ghEntries.toRows("news", "rss", "feed", "reader"),
+                        social       = ghEntries.toRows("social", "messag", "chat", "network"),
+                        cloudStorage = ghEntries.toRows("cloud", "storage", "backup", "sync"),
+                        cooking      = ghEntries.toRows("cooking", "food", "recipe")
+                    )
+                }
+                state = ns
             } catch (e: Exception) {
                 state = state.copy(isLoading = false)
                 if (e is kotlinx.coroutines.CancellationException) throw e
@@ -1041,93 +1224,83 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
             updateRecommendations()
 
-            // ── CDN source rows — all 5 sources in parallel ──────────────────
-            // Each source tries the per-source browse file first; if that fails or
-            // returns empty it falls back to filtering the global index by source.
-            if (!isActive) { state = state.copy(isLoading = false); return@launch }
-            try {
-                val c = MetadataManager.get()
-                suspend fun cdnSource(key: String): List<GitHubRepo> {
-                    val fromBrowse = try { c.browseSource(key, 1).apps.map { it.toGitHubRepo() } }
-                                     catch (_: Exception) { emptyList() }
-                    if (fromBrowse.isNotEmpty()) return fromBrowse
-                    return try { c.search("", source = key).take(50).map { it.toGitHubRepo() } }
-                           catch (_: Exception) { emptyList() }
-                }
-                val glD = async { cdnSource("gitlab") }
-                val cbD = async { cdnSource("codeberg") }
-                val fdD = async { cdnSource("fdroid") }
-                val fhD = async {
-                    val fromCdn = cdnSource("flathub")
-                    if (fromCdn.isNotEmpty()) fromCdn
-                    else try { FlathubClient.service.getPopular().hits?.map { it.toUnifiedRepo() } ?: emptyList() }
-                         catch (_: Exception) { emptyList() }
-                }
-                val wgD = async { cdnSource("winget") }
-                val gl = glD.await(); val cb = cbD.await(); val fd = fdD.await()
-                val fh = fhD.await(); val wg = wgD.await()
-                if (!isActive) return@launch
-                state = state.copy(gitlabApps = gl, codebergApps = cb, fdroidApps = fd, flathubApps = fh, wingetApps = wg)
-            } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+            // ── Phase 2: Live API fallback for GitHub category rows ───────────
+            // Only fires when CDN github source returned no data.
+            if (state.trending.isEmpty() && isActive) {
+                // Batch 1: primary rows
+                try {
+                    val tD = async { searchCached("topic:android apk stars:>100",          perPage = 20, page = loadPage) }
+                    val mD = async { searchCached("topic:android media player stars:>50",  perPage = 20, page = loadPage) }
+                    val uD = async { searchCached("topic:android utility tool stars:>50",  perPage = 20, page = loadPage) }
+                    val gD = async { searchCached("topic:android game emulator stars:>50", perPage = 20, page = loadPage) }
+                    val t = tD.await(); val m = mD.await(); val u = uD.await(); val g = gD.await()
+                    if (!isActive) return@launch
+                    state = state.copy(
+                        trending = t?.items?.shuffled() ?: emptyList(),
+                        media    = m?.items?.shuffled() ?: emptyList(),
+                        tools    = u?.items?.shuffled() ?: emptyList(),
+                        games    = g?.items?.shuffled() ?: emptyList()
+                    )
+                } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
 
-            // ── Batch 2: secondary categories — 4 parallel ───────────────────
-            if (!isActive) return@launch
-            try {
-                val brD = async { searchCached("topic:android browser privacy stars:>50",    perPage = 20, page = loadPage) }
-                val prD = async { searchCached("topic:android productivity notes stars:>50", perPage = 20, page = loadPage) }
-                val seD = async { searchCached("topic:android security stars:>50",           perPage = 20, page = loadPage) }
-                val deD = async { searchCached("topic:android developer-tools stars:>50",    perPage = 20, page = loadPage) }
-                val br = brD.await(); val pr = prD.await(); val se = seD.await(); val de = deD.await()
-                if (!isActive) return@launch
-                state = state.copy(
-                    browsers     = br?.items?.shuffled() ?: emptyList(),
-                    productivity = pr?.items?.shuffled() ?: emptyList(),
-                    security     = se?.items?.shuffled() ?: emptyList(),
-                    devtools     = de?.items?.shuffled() ?: emptyList()
-                )
-            } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+                updateRecommendations()
 
-            // ── Batch 3: entertainment / lifestyle — 4 parallel ──────────────
-            if (!isActive) return@launch
-            try {
-                val pvD = async { searchCached("topic:android photo video editor stars:>100", perPage = 20, page = loadPage) }
-                val muD = async { searchCached("topic:android music audio stars:>100",        perPage = 20, page = loadPage) }
-                val fiD = async { searchCached("topic:android finance banking stars:>100",    perPage = 20, page = loadPage) }
-                val edD = async { searchCached("topic:android education learning stars:>100", perPage = 20, page = loadPage) }
-                val pv = pvD.await(); val mu = muD.await(); val fi = fiD.await(); val ed = edD.await()
+                // Batch 2: secondary categories
                 if (!isActive) return@launch
-                state = state.copy(
-                    photoVideo = pv?.items?.shuffled() ?: emptyList(),
-                    music      = mu?.items?.shuffled() ?: emptyList(),
-                    finance    = fi?.items?.shuffled() ?: emptyList(),
-                    education  = ed?.items?.shuffled() ?: emptyList()
-                )
-            } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+                try {
+                    val brD = async { searchCached("topic:android browser privacy stars:>50",    perPage = 20, page = loadPage) }
+                    val prD = async { searchCached("topic:android productivity notes stars:>50", perPage = 20, page = loadPage) }
+                    val seD = async { searchCached("topic:android security stars:>50",           perPage = 20, page = loadPage) }
+                    val deD = async { searchCached("topic:android developer-tools stars:>50",    perPage = 20, page = loadPage) }
+                    val br = brD.await(); val pr = prD.await(); val se = seD.await(); val de = deD.await()
+                    if (!isActive) return@launch
+                    state = state.copy(
+                        browsers     = br?.items?.shuffled() ?: emptyList(),
+                        productivity = pr?.items?.shuffled() ?: emptyList(),
+                        security     = se?.items?.shuffled() ?: emptyList(),
+                        devtools     = de?.items?.shuffled() ?: emptyList()
+                    )
+                } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
 
-            // ── Batch 4: remaining rows — 6 parallel ─────────────────────────
-            if (!isActive) return@launch
-            try {
-                val ftD = async { searchCached("topic:android fitness health workout stars:>100", perPage = 20, page = loadPage) }
-                val arD = async { searchCached("topic:android art design creative stars:>100",   perPage = 20, page = loadPage) }
-                val nwD = async { searchCached("topic:android news reader stars:>100",           perPage = 20, page = loadPage) }
-                val scD = async { searchCached("topic:android social network stars:>100",        perPage = 20, page = loadPage) }
-                val csD = async { searchCached("topic:android cloud storage files stars:>100",   perPage = 20, page = loadPage) }
-                val ckD = async { searchCached("topic:android cooking food recipe stars:>50",    perPage = 20, page = loadPage) }
-                val izD = async { safeApi { RetrofitClient.service.searchRepos("user:IzzyOnDroid stars:>10", perPage = 20, page = 1) }
-                    ?.items?.map { it.copy(source = AppSource.IZZY) } }
-                val ft = ftD.await(); val ar = arD.await(); val nw = nwD.await()
-                val sc = scD.await(); val cs = csD.await(); val ck = ckD.await(); val iz = izD.await()
+                // Batch 3: entertainment / lifestyle
                 if (!isActive) return@launch
-                state = state.copy(
-                    fitness      = ft?.items?.shuffled() ?: emptyList(),
-                    artDesign    = ar?.items?.shuffled() ?: emptyList(),
-                    news         = nw?.items?.shuffled() ?: emptyList(),
-                    social       = sc?.items?.shuffled() ?: emptyList(),
-                    cloudStorage = cs?.items?.shuffled() ?: emptyList(),
-                    cooking      = ck?.items?.shuffled() ?: emptyList(),
-                    izzyApps     = iz ?: emptyList()
-                )
-            } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+                try {
+                    val pvD = async { searchCached("topic:android photo video editor stars:>100", perPage = 20, page = loadPage) }
+                    val muD = async { searchCached("topic:android music audio stars:>100",        perPage = 20, page = loadPage) }
+                    val fiD = async { searchCached("topic:android finance banking stars:>100",    perPage = 20, page = loadPage) }
+                    val edD = async { searchCached("topic:android education learning stars:>100", perPage = 20, page = loadPage) }
+                    val pv = pvD.await(); val mu = muD.await(); val fi = fiD.await(); val ed = edD.await()
+                    if (!isActive) return@launch
+                    state = state.copy(
+                        photoVideo = pv?.items?.shuffled() ?: emptyList(),
+                        music      = mu?.items?.shuffled() ?: emptyList(),
+                        finance    = fi?.items?.shuffled() ?: emptyList(),
+                        education  = ed?.items?.shuffled() ?: emptyList()
+                    )
+                } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+
+                // Batch 4: remaining rows
+                if (!isActive) return@launch
+                try {
+                    val ftD = async { searchCached("topic:android fitness health workout stars:>100", perPage = 20, page = loadPage) }
+                    val arD = async { searchCached("topic:android art design creative stars:>100",   perPage = 20, page = loadPage) }
+                    val nwD = async { searchCached("topic:android news reader stars:>100",           perPage = 20, page = loadPage) }
+                    val scD = async { searchCached("topic:android social network stars:>100",        perPage = 20, page = loadPage) }
+                    val csD = async { searchCached("topic:android cloud storage files stars:>100",   perPage = 20, page = loadPage) }
+                    val ckD = async { searchCached("topic:android cooking food recipe stars:>50",    perPage = 20, page = loadPage) }
+                    val ft = ftD.await(); val ar = arD.await(); val nw = nwD.await()
+                    val sc = scD.await(); val cs = csD.await(); val ck = ckD.await()
+                    if (!isActive) return@launch
+                    state = state.copy(
+                        fitness      = ft?.items?.shuffled() ?: emptyList(),
+                        artDesign    = ar?.items?.shuffled() ?: emptyList(),
+                        news         = nw?.items?.shuffled() ?: emptyList(),
+                        social       = sc?.items?.shuffled() ?: emptyList(),
+                        cloudStorage = cs?.items?.shuffled() ?: emptyList(),
+                        cooking      = ck?.items?.shuffled() ?: emptyList()
+                    )
+                } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e }
+            }
 
             updateRecommendations()
             checkForUpdatesNow()
@@ -1260,12 +1433,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         fuzzyMatch(repo.owner.login, qt) ||
                         (!repo.description.isNullOrEmpty() && fuzzyMatch(repo.description, qt))
             }.sortedByDescending { it.stargazers_count }
-        } else emptyList()
+        } else {
+            // No text — show loaded apps that match the active platform filter
+            val platformSources: Set<AppSource>? = when (state.platform) {
+                AppPlatform.ANDROID -> setOf(AppSource.GITHUB, AppSource.IZZY, AppSource.FDROID)
+                AppPlatform.WINDOWS -> setOf(AppSource.WINGET)
+                AppPlatform.LINUX   -> setOf(AppSource.FLATHUB, AppSource.CODEBERG, AppSource.GITLAB)
+                AppPlatform.TV      -> setOf(AppSource.GITHUB, AppSource.IZZY)
+                AppPlatform.IOS     -> emptySet()
+                else                -> null   // ALL with no text → keep empty (default state)
+            }
+            if (platformSources != null)
+                allNormalized.filter { it.source in platformSources }
+                             .sortedByDescending { it.stargazers_count }
+            else emptyList()
+        }
 
-        // Show local cache immediately; only mark as searching when there is a text query
         state = state.copy(searchResults = localMatches, isSearching = q.isNotBlank())
 
-        if (q.isBlank()) return  // platform/subcategory filter only — local results are sufficient
+        if (q.isBlank()) return  // live API only fires with text; platform filter uses local data above
 
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
@@ -1422,7 +1608,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (languageChanged) state = state.copy(translatedDescriptions = emptyMap())
         RetrofitClient.authToken = s.githubToken
         prefs.saveSettings(s)
-        prefs.saveAppSettings(s)
     }
 
     fun fetchRelease(repo: GitHubRepo) {
@@ -1457,47 +1642,80 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
 
-            // GitHub / IzzyOnDroid: fetch release from GitHub API
+            // GitHub / IzzyOnDroid: try CDN-cached releases first, fall back to direct API
             updateInstall(repo.id) { copy(isLoadingRelease = true, error = null) }
             try {
                 var foundRelease : Release?      = null
                 var foundApk     : ReleaseAsset? = null
-                var releaseCount : Int           = 0
+                var allReleases  : List<Release> = emptyList()
 
+                // 1. Try CDN-pre-cached releases (no token needed, populated by fetch_releases.py)
                 try {
-                    val latest   = RetrofitClient.service.getLatestRelease(repo.owner.login, repo.name)
-                    foundRelease = latest
-                    foundApk     = detectBestApk(latest.assets)?.asset
-                    releaseCount = 1
+                    val cdnUrl = "https://NikhilKain.github.io/appstore-metadata/data/releases/github" +
+                            "/${repo.owner.login}/${repo.name}.json"
+                    val cdnReleases: List<Release>? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        val r = okhttp3.OkHttpClient().newCall(
+                            okhttp3.Request.Builder().url(cdnUrl).build()
+                        ).execute()
+                        try {
+                            if (!r.isSuccessful) null
+                            else {
+                                val body = r.body?.string()
+                                if (body.isNullOrBlank()) null
+                                else {
+                                    val type = object : TypeToken<List<Release>>() {}.type
+                                    val parsed: List<Release> = Gson().fromJson(body, type)
+                                    parsed.takeIf { it.isNotEmpty() }
+                                }
+                            }
+                        } finally { r.close() }
+                    }
+                    if (cdnReleases != null) {
+                        allReleases  = cdnReleases
+                        foundRelease = cdnReleases.first()
+                        for (rel in cdnReleases) {
+                            val apk = detectBestApk(rel.assets)?.asset
+                            if (apk != null) { foundRelease = rel; foundApk = apk; break }
+                        }
+                    }
                 } catch (_: Exception) {}
 
-                if (foundApk == null) {
+                // 2. Fall back to direct GitHub API if CDN didn't have this repo pre-cached
+                if (foundRelease == null) {
                     try {
-                        val releases = RetrofitClient.service.getReleases(repo.owner.login, repo.name, 10)
-                        releaseCount = releases.size
-                        for (r in releases) {
-                            if (foundRelease == null) foundRelease = r
-                            val apk = detectBestApk(r.assets)?.asset
-                            if (apk != null) { foundRelease = r; foundApk = apk; break }
+                        val latest   = RetrofitClient.service.getLatestRelease(repo.owner.login, repo.name)
+                        foundRelease = latest
+                        foundApk     = detectBestApk(latest.assets)?.asset
+                    } catch (_: Exception) {}
+
+                    try {
+                        allReleases = RetrofitClient.service.getReleases(repo.owner.login, repo.name, 10)
+                        if (foundApk == null) {
+                            for (r in allReleases) {
+                                if (foundRelease == null) foundRelease = r
+                                val apk = detectBestApk(r.assets)?.asset
+                                if (apk != null) { foundRelease = r; foundApk = apk; break }
+                            }
                         }
                     } catch (_: Exception) {}
                 }
 
                 if (foundRelease != null) {
                     val smart = detectBestApk(foundRelease.assets)
-                    val trust = calculateTrustScore(repo, releaseCount)
+                    val trust = calculateTrustScore(repo, allReleases.size.coerceAtLeast(1))
                     updateInstall(repo.id) {
                         copy(
                             isLoadingRelease = false,
+                            releases         = allReleases,
                             release          = foundRelease,
-                            apkAsset         = smart?.asset ?: foundApk,
+                            apkAsset         = smart?.asset ?: foundApk ?: foundRelease.assets.firstOrNull(),
                             smartInstall     = smart,
                             trustScore       = trust
                         )
                     }
                 } else {
                     updateInstall(repo.id) {
-                        copy(isLoadingRelease = false, error = "No releases found.")
+                        copy(isLoadingRelease = false, releases = allReleases, error = "No releases found.")
                     }
                 }
             } catch (e: Exception) {
@@ -1576,7 +1794,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val req = DownloadManager.Request(Uri.parse(asset.browser_download_url))
                     .setTitle("Downloading ${repo.name}").setDescription("Saved to Downloads")
                     .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "${repo.name}.apk")
+                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, asset.name)
                     .setAllowedOverMetered(true).setAllowedOverRoaming(true)
                 val dlId = dm.enqueue(req)
                 updateInstall(repo.id) { copy(downloadId = dlId) }
@@ -1635,7 +1853,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun launchUninstall(repoId: Long, pkg: String) {
         try {
             ctx.startActivity(
-                android.content.Intent(android.content.Intent.ACTION_UNINSTALL_PACKAGE).apply {
+                android.content.Intent(android.content.Intent.ACTION_DELETE).apply {
                     data = android.net.Uri.parse("package:$pkg")
                     putExtra(android.content.Intent.EXTRA_RETURN_RESULT, false)
                     addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1666,6 +1884,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun translateDescription(repo: GitHubRepo) {
         val desc = repo.description ?: return
         val lang = when (state.settings.language) {
+            "English"    -> "en"
             "Hindi"      -> "hi"
             "Spanish"    -> "es"
             "French"     -> "fr"
@@ -1681,20 +1900,77 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "Turkish"    -> "tr"
             "Polish"     -> "pl"
             "Swedish"    -> "sv"
-            else         -> return
+            else         -> "en"
         }
         viewModelScope.launch {
             state = state.copy(isTranslating = state.isTranslating + (repo.id to true))
             try {
-                val r = TranslationClient.service.translate(desc, "en|$lang")
+                val r = GTranslateClient.service.translate("gtx", "auto", lang, "t", desc)
+                val translated = r[0].asJsonArray.joinToString("") { chunk ->
+                    runCatching { chunk.asJsonArray[0].asString }.getOrDefault("")
+                }
                 state = state.copy(
-                    translatedDescriptions = state.translatedDescriptions + (repo.id to r.responseData.translatedText),
+                    translatedDescriptions = state.translatedDescriptions + (repo.id to translated),
                     isTranslating          = state.isTranslating + (repo.id to false)
                 )
             } catch (_: Exception) {
                 state = state.copy(isTranslating = state.isTranslating + (repo.id to false))
             }
         }
+    }
+
+    fun translateReleaseBody(repo: GitHubRepo) {
+        val body = state.installStates[repo.id]?.release?.body?.takeIf { it.isNotBlank() } ?: return
+        val lang = when (state.settings.language) {
+            "English"    -> "en"
+            "Hindi"      -> "hi"
+            "Spanish"    -> "es"
+            "French"     -> "fr"
+            "German"     -> "de"
+            "Japanese"   -> "ja"
+            "Portuguese" -> "pt"
+            "Italian"    -> "it"
+            "Russian"    -> "ru"
+            "Chinese"    -> "zh"
+            "Korean"     -> "ko"
+            "Arabic"     -> "ar"
+            "Dutch"      -> "nl"
+            "Turkish"    -> "tr"
+            "Polish"     -> "pl"
+            "Swedish"    -> "sv"
+            else         -> "en"
+        }
+        viewModelScope.launch {
+            state = state.copy(isTranslatingRelease = state.isTranslatingRelease + (repo.id to true))
+            try {
+                val r = GTranslateClient.service.translate("gtx", "auto", lang, "t", body.take(500))
+                val translated = r[0].asJsonArray.joinToString("") { chunk ->
+                    runCatching { chunk.asJsonArray[0].asString }.getOrDefault("")
+                }
+                state = state.copy(
+                    translatedReleaseBodies = state.translatedReleaseBodies + (repo.id to translated),
+                    isTranslatingRelease    = state.isTranslatingRelease + (repo.id to false)
+                )
+            } catch (_: Exception) {
+                state = state.copy(isTranslatingRelease = state.isTranslatingRelease + (repo.id to false))
+            }
+        }
+    }
+
+    fun clearNotifications() {
+        prefs.saveNotifsDismissed(true)
+        state = state.copy(notifsDismissed = true)
+    }
+
+    fun selectRelease(repoId: Long, release: Release) {
+        val bestApk = detectBestApk(release.assets)?.asset
+            ?: release.assets.firstOrNull { it.name.endsWith(".apk", ignoreCase = true) }
+            ?: release.assets.firstOrNull()
+        updateInstall(repoId) { copy(release = release, apkAsset = bestApk) }
+    }
+
+    fun selectAsset(repoId: Long, asset: ReleaseAsset) {
+        updateInstall(repoId) { copy(apkAsset = asset) }
     }
 
     private fun installed(pkg: String) = try {
@@ -1750,8 +2026,66 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (_: Exception) {}
             }
 
-            state = state.copy(updates = updates.distinctBy { it.repoId }, isCheckingUpdates = false)
+            val newUpdates = updates.distinctBy { it.repoId }
+            val hasNewUpdates = newUpdates.any { n ->
+                state.updates.none { o -> o.repoId == n.repoId && o.latestTag == n.latestTag }
+            }
+            val newDismissed = if (hasNewUpdates) false else state.notifsDismissed
+            state = state.copy(
+                updates           = newUpdates,
+                isCheckingUpdates = false,
+                notifsDismissed   = newDismissed
+            )
+            prefs.saveUpdates(newUpdates)
+            if (hasNewUpdates) prefs.saveNotifsDismissed(false)
         }
+    }
+
+    fun updateAll() {
+        if (state.updates.isEmpty()) return
+        viewModelScope.launch {
+            val history = state.installHistory
+                .groupBy { it.repoId }
+                .mapValues { (_, v) -> v.maxByOrNull { it.installedAt }!! }
+            for (update in state.updates) {
+                val entry = history[update.repoId] ?: continue
+                try {
+                    val release  = RetrofitClient.service.getLatestRelease(entry.ownerLogin, entry.repoName)
+                    val apkAsset = release.assets.firstOrNull { it.name.endsWith(".apk", ignoreCase = true) }
+                                   ?: continue
+                    val repo = state.installStates[entry.repoId]?.repo ?: GitHubRepo(
+                        id        = entry.repoId,
+                        name      = entry.repoName,
+                        full_name = "${entry.ownerLogin}/${entry.repoName}",
+                        owner     = RepoOwner(login = entry.ownerLogin)
+                    )
+                    updateInstall(repo.id) { copy(release = release, apkAsset = apkAsset, repo = repo) }
+                    downloadAndInstall(repo, apkAsset)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun clearRemovedApps() {
+        val history = state.installHistory
+            .groupBy { it.repoId }
+            .mapValues { (_, v) -> v.maxByOrNull { it.installedAt }!! }
+        val removedIds = history.values
+            .filter { entry ->
+                val iState = state.installStates[entry.repoId]
+                iState != null && !iState.isInstalled
+            }
+            .map { it.repoId }
+            .toSet()
+        if (removedIds.isEmpty()) return
+        val pruned = state.installHistory.filter { it.repoId !in removedIds }
+        state = state.copy(
+            installHistory = pruned,
+            installStates  = state.installStates.filter { it.key !in removedIds },
+            updates        = state.updates.filter { it.repoId !in removedIds }
+        )
+        prefs.saveInstallHistory(pruned)
+        prefs.saveUpdates(state.updates)
     }
 
     fun ignoreVersion(repoId: Long, tag: String) {
@@ -1800,7 +2134,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val starred = RetrofitClient.service.getStarredRepos(perPage = 50)
                 val merged  = (starred + state.favourites).distinctBy { it.id }
                 state = state.copy(favourites = merged)
-                prefs.saveHistory(merged.map { HistoryItem(it) })
+                prefs.saveFavourites(merged)
             } catch (e: Exception) {
                 state = state.copy(error = "Could not sync starred: ${e.message}")
             }
@@ -1808,4 +2142,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setCompareTarget(repo: GitHubRepo?) { state = state.copy(compareTargetRepo = repo) }
+
+    fun checkSelfUpdate() {
+        val rawPrefs  = ctx.getSharedPreferences("vyxel_prefs", android.content.Context.MODE_PRIVATE)
+        val lastCheck = rawPrefs.getLong("last_update_check", 0L)
+        if (System.currentTimeMillis() - lastCheck < 6 * 60 * 60 * 1000L) return
+        viewModelScope.launch {
+            try {
+                val release = RetrofitClient.service.getLatestRelease("NikhilKain", "vyxel-apps")
+                val latest  = release.tag_name.trimStart('v', 'V')
+                val current = BuildConfig.VERSION_NAME
+                if (isNewerVersion(latest, current)) {
+                    val apkAsset = release.assets.firstOrNull { it.name.endsWith(".apk") }
+                    state = state.copy(
+                        selfUpdateInfo = SelfUpdateInfo(
+                            latestVersion = release.tag_name,
+                            apkUrl        = apkAsset?.browser_download_url
+                                ?: "https://github.com/NikhilKain/vyxel-apps/releases/latest",
+                            changelog     = release.body
+                        )
+                    )
+                }
+                rawPrefs.edit().putLong("last_update_check", System.currentTimeMillis()).apply()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun dismissSelfUpdate() {
+        state = state.copy(selfUpdateDismissed = true)
+    }
+
+    private fun isNewerVersion(latest: String, current: String): Boolean {
+        val l = latest.split(".").mapNotNull { it.toIntOrNull() }
+        val c = current.split(".").mapNotNull { it.toIntOrNull() }
+        for (i in 0 until maxOf(l.size, c.size)) {
+            val lv = l.getOrElse(i) { 0 }
+            val cv = c.getOrElse(i) { 0 }
+            if (lv > cv) return true
+            if (lv < cv) return false
+        }
+        return false
+    }
 }

@@ -7,6 +7,7 @@ import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import com.vythera.vyxelapps.R
 
 class UpdateCheckWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
@@ -14,7 +15,7 @@ class UpdateCheckWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         val prefs   = PreferencesManager(applicationContext)
         val history = prefs.loadInstallHistory().distinctBy { it.repoId }
         val ignored = prefs.loadIgnoredVersions()
-        val token   = prefs.loadAppSettings().githubToken
+        val token   = prefs.loadSettings().githubToken
         if (token.isNotEmpty()) RetrofitClient.authToken = token
 
         val available = mutableListOf<Pair<String, String>>()
@@ -42,7 +43,7 @@ class UpdateCheckWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         val text  = updates.take(3).joinToString(", ") { "${it.first} → ${it.second}" }
 
         val notif = NotificationCompat.Builder(applicationContext, "vyxel_updates")
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(title)
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
