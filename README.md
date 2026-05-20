@@ -8,7 +8,7 @@
 
 Discover, install, and update Android apps from GitHub releases — free, open-source, no ads, no tracking.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/NikhilKain/vyxel-apps)](https://github.com/NikhilKain/vyxel-apps/releases)
 [![Stars](https://img.shields.io/github/stars/NikhilKain/vyxel-apps?style=social)](https://github.com/NikhilKain/vyxel-apps/stargazers)
 
