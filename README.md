@@ -72,6 +72,10 @@ If Vyxel Apps is useful to you:
 - 🐛 Report bugs in [Issues](https://github.com/NikhilKain/vyxel-apps/issues)
 - 📝 Send feedback via the in-app feedback button
 
+## App Support 
+
+ - https://t.me/vyxelapps
+
 ## 📄 License
 
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
